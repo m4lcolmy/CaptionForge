@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "captionforge"
+version = "0.7.0"
+description = "A production-oriented foundation for subtitle retrieval, transcription, and export."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "CaptionForge Contributors" }]
+dependencies = [
+    "typer>=0.12,<1.0",
+    "rich>=13.7,<15.0",
+    "pydantic>=2.7,<3.0",
+    "python-dotenv>=1.0,<2.0",
+    "loguru>=0.7,<1.0",
+    "yt-dlp>=2025.6",
+]
+
+[project.scripts]
+captionforge = "app.main:main"
+
+[project.optional-dependencies]
+transcription = [
+    "faster-whisper>=1.1,<2.0",
+]
+dev = [
+    "black>=24.4",
+    "mypy>=1.10",
+    "pytest>=8.2",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+addopts = "-ra -m 'not integration'"
+testpaths = ["tests"]
+markers = [
+    "integration: optional tests that may access external services",
+]
+
+[tool.mypy]
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+check_untyped_defs = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = ["yt_dlp", "yt_dlp.*"]
+ignore_missing_imports = true

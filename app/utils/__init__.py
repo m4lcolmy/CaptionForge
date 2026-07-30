@@ -1,0 +1,1 @@
+"""Shared utility extension point."""
