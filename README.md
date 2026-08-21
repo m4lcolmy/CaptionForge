@@ -8,9 +8,10 @@ caption exists, it prepares mono 16 kHz audio and transcribes it locally with
 
 - Inspect video metadata and available caption tracks
 - Select captions by preferred language
-- Export SRT, VTT, TXT, or JSON
+- Export SRT, VTT, TXT, JSON, or DOCX
 - Generate multiple formats in one command
 - Create plain or timestamped TXT transcripts
+- Save a Word transcript as plain prose, with right-to-left support
 - Preserve Arabic words, punctuation, and diacritics
 - Produce safe filenames and prevent accidental overwrites
 - Prepare audio-only fallback input with yt-dlp and FFmpeg
@@ -60,6 +61,20 @@ captionforge extract "https://youtu.be/qJFbKl6RjLU?si=wdoe8oQzasIgydBk" \
   --output ./output
 ```
 
+Save a Word document instead of a subtitle file:
+
+```bash
+captionforge extract "https://youtu.be/qJFbKl6RjLU?si=wdoe8oQzasIgydBk" \
+  --language ar --format docx --output ./output
+```
+
+The `docx` format writes the transcript as plain readable prose: no cue numbers
+and no timestamps. Consecutive cues are joined into paragraphs that break at a
+silent gap, at a sentence boundary, or at a length limit. The video title becomes
+the document heading, and Arabic (or any other right-to-left language) is written
+right-aligned with the correct text direction. `--timestamped-txt` affects TXT
+only and never adds timings to the Word document.
+
 Export captions when available, otherwise transcribe locally:
 
 ```bash
@@ -74,8 +89,9 @@ replace output files. The default model is `small`, avoiding an impractical
 large-model default on low-resource machines.
 
 `captionforge prepare-audio` remains available for audio-only diagnostics.
-Run `captionforge doctor` to check FFmpeg, yt-dlp, faster-whisper, CUDA, the
-detected GPU, recommendations, and folder access. Doctor never downloads a model.
+Run `captionforge doctor` to check FFmpeg, yt-dlp, faster-whisper, python-docx,
+CUDA, the detected GPU, recommendations, and folder access. Doctor never
+downloads a model.
 
 Post-processing is enabled for both downloaded captions and Whisper results. Use
 `--no-postprocess` with `extract` or `transcribe` when source segmentation must be
@@ -87,7 +103,8 @@ captionforge clean captions.vtt --output ./output
 ```
 
 The clean command preserves the input format and writes `*.cleaned.srt` or
-`*.cleaned.vtt` unless another destination is supplied.
+`*.cleaned.vtt` unless another destination is supplied; it does not convert to
+DOCX.
 
 ## Configuration
 
@@ -165,7 +182,7 @@ Useful options:
 
 ```text
 --language ar       Preferred caption language
---format FORMAT     srt, vtt, txt, or json; may be repeated
+--format FORMAT     srt, vtt, txt, json, or docx; may be repeated
 --output PATH       Output directory
 --timestamped-txt   Add timestamps to TXT output
 --overwrite         Replace existing output files

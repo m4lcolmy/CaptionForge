@@ -1,11 +1,12 @@
 """Coordinate safe multi-format subtitle exports."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from pathlib import Path
 
 from app.core.constants import SUPPORTED_OUTPUT_FORMATS
 from app.core.exceptions import ExportError
+from app.exporters.docx_exporter import render_docx
 from app.exporters.json_exporter import render_json
 from app.exporters.srt_exporter import render_srt
 from app.exporters.txt_exporter import render_txt
@@ -13,7 +14,7 @@ from app.exporters.vtt_exporter import render_vtt
 from app.models.subtitle import SubtitleSegment, SubtitleTrack
 from app.models.video import VideoMetadata
 from app.utils.file_utils import (
-    atomic_write_text,
+    atomic_write_bytes,
     ensure_disk_space,
     ensure_output_directory,
     sanitize_filename,
@@ -21,7 +22,7 @@ from app.utils.file_utils import (
 
 
 class ExportService:
-    """Validate destinations and write requested subtitle formats as UTF-8."""
+    """Validate destinations and write requested subtitle formats."""
 
     def export(
         self,
@@ -52,20 +53,23 @@ class ExportService:
                 f"Output file already exists: {existing[0]}. "
                 "Use --overwrite to replace it."
             )
-        rendered = {
+        rendered: dict[str, Callable[[], str | bytes]] = {
             "srt": lambda: render_srt(segments),
             "vtt": lambda: render_vtt(segments),
             "txt": lambda: render_txt(segments, timestamped=timestamped_txt),
             "json": lambda: render_json(video, track, segments),
+            "docx": lambda: render_docx(
+                video, segments, language=track.normalized_language_code
+            ),
         }
-        contents = tuple(rendered[extension]() for extension in normalized)
-        required_bytes = sum(len(item.encode("utf-8")) for item in contents)
+        contents = tuple(_as_bytes(rendered[extension]()) for extension in normalized)
+        required_bytes = sum(len(item) for item in contents)
         ensure_disk_space(directory, required_bytes)
         created: list[Path] = []
         try:
             for path, content in zip(paths, contents, strict=True):
                 was_present = path.exists()
-                atomic_write_text(path, content, overwrite=overwrite)
+                atomic_write_bytes(path, content, overwrite=overwrite)
                 if not was_present:
                     created.append(path)
         except ExportError:
@@ -74,3 +78,8 @@ class ExportService:
                     path.unlink(missing_ok=True)
             raise
         return paths
+
+
+def _as_bytes(content: str | bytes) -> bytes:
+    """Return exporter output as the bytes that will land on disk."""
+    return content if isinstance(content, bytes) else content.encode("utf-8")

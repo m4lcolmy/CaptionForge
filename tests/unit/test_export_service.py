@@ -1,9 +1,11 @@
 """Tests for safe UTF-8 multi-format subtitle export."""
 
 import json
+from io import BytesIO
 from pathlib import Path
 
 import pytest
+from docx import Document
 
 from app.core.exceptions import ExportError
 from app.models.subtitle import SubtitleSegment
@@ -54,6 +56,39 @@ def test_all_exports_and_arabic_utf8(
     assert payload["selected_language"] == "ar"
     assert payload["caption_source_type"] == "manual"
     assert payload["segments"][0]["text"] == "مرحباً بالعالم"
+
+
+def test_docx_export_is_a_readable_word_document(
+    tmp_path: Path, video_metadata: object, segments: tuple[SubtitleSegment, ...]
+) -> None:
+    path = ExportService().export(
+        video_metadata,  # type: ignore[arg-type]
+        make_track("ar"),
+        segments,
+        ("docx",),
+        tmp_path,
+    )[0]
+
+    assert path.suffix == ".docx"
+    document = Document(BytesIO(path.read_bytes()))
+    texts = [paragraph.text for paragraph in document.paragraphs if paragraph.text]
+    assert texts[-1] == "مرحباً بالعالم السطر الثاني"
+
+
+def test_docx_exports_alongside_text_formats(
+    tmp_path: Path, video_metadata: object, segments: tuple[SubtitleSegment, ...]
+) -> None:
+    paths = ExportService().export(
+        video_metadata,  # type: ignore[arg-type]
+        make_track("ar"),
+        segments,
+        ("srt", "docx", "txt"),
+        tmp_path,
+    )
+
+    assert [path.suffix for path in paths] == [".srt", ".docx", ".txt"]
+    assert (tmp_path / f"{video_metadata.title}.docx").read_bytes()[:2] == b"PK"  # type: ignore[attr-defined]
+    assert not list(tmp_path.glob("*.partial"))
 
 
 def test_timestamped_txt(

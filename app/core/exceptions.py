@@ -160,5 +160,9 @@ class ExportError(CaptionForgeError):
     """Raised when subtitle output cannot be safely exported."""
 
 
+class DocxNotInstalledError(ExportError):
+    """Raised when the optional python-docx dependency is unavailable."""
+
+
 class ValidationError(CaptionForgeError):
     """Raised when application-level input validation fails."""

@@ -10,7 +10,7 @@ LOG_FILE_NAME: Final[str] = "captionforge_{time:YYYY-MM-DD}.log"
 LOG_ROTATION: Final[str] = "10 MB"
 LOG_RETENTION: Final[str] = "14 days"
 SUPPORTED_OUTPUT_FORMATS: Final[frozenset[str]] = frozenset(
-    {"srt", "vtt", "txt", "json"}
+    {"srt", "vtt", "txt", "json", "docx"}
 )
 
 

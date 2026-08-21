@@ -190,6 +190,13 @@ def doctor() -> None:
         except PackageNotFoundError:
             table.add_row("faster-whisper installed", "No")
             table.add_row("faster-whisper version", "Not available")
+        try:
+            docx_version = package_version("python-docx")
+            table.add_row("python-docx installed", "Yes")
+            table.add_row("python-docx version", docx_version)
+        except PackageNotFoundError:
+            table.add_row("python-docx installed", "No")
+            table.add_row("python-docx version", "Not available")
         whisper = WhisperAdapter()
         cuda_available = whisper.cuda_available()
         recommended_device = "cuda" if cuda_available else "cpu"
@@ -267,7 +274,7 @@ def transcribe(
         typer.Option(
             "--format",
             "-f",
-            help="Output format; repeat for srt, vtt, txt, or json.",
+            help="Output format; repeat for srt, vtt, txt, json, or docx.",
         ),
     ] = None,
     output: Annotated[
@@ -422,7 +429,10 @@ def extract(
         typer.Option(
             "--format",
             "-f",
-            help="Output format; repeat for multiple formats (srt, vtt, txt, json).",
+            help=(
+                "Output format; repeat for multiple formats "
+                "(srt, vtt, txt, json, docx)."
+            ),
         ),
     ] = None,
     output: Annotated[

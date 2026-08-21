@@ -4,6 +4,9 @@ import re
 
 _LANGUAGE_PART = re.compile(r"^[A-Za-z]{2,3}$")
 _REGION_PART = re.compile(r"^(?:[A-Za-z]{2}|\d{3})$")
+_RIGHT_TO_LEFT_LANGUAGES = frozenset(
+    {"ar", "arc", "az", "dv", "fa", "he", "iw", "ku", "ps", "sd", "ug", "ur", "yi"}
+)
 _LANGUAGE_NAMES = {
     "ar": "Arabic",
     "en": "English",
@@ -44,3 +47,9 @@ def language_name(value: str | None) -> str | None:
     """Return a small built-in display name for a language code."""
     base = base_language(value)
     return _LANGUAGE_NAMES.get(base) if base else None
+
+
+def is_right_to_left(value: str | None) -> bool:
+    """Return whether a language identifier is written right-to-left."""
+    base = base_language(value)
+    return base in _RIGHT_TO_LEFT_LANGUAGES if base else False

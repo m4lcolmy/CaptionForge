@@ -87,6 +87,11 @@ def ensure_disk_space(directory: Path, required_bytes: int) -> None:
 
 def atomic_write_text(path: Path, content: str, *, overwrite: bool = False) -> None:
     """Write UTF-8 text and replace the destination only after a complete flush."""
+    atomic_write_bytes(path, content.encode("utf-8"), overwrite=overwrite)
+
+
+def atomic_write_bytes(path: Path, content: bytes, *, overwrite: bool = False) -> None:
+    """Write bytes and replace the destination only after a complete flush."""
     if path.exists() and not overwrite:
         raise ExportError(f"Output file already exists: {path}. Use --overwrite.")
     temporary: Path | None = None
@@ -95,7 +100,7 @@ def atomic_write_text(path: Path, content: str, *, overwrite: bool = False) -> N
             prefix=f".{path.name}.", suffix=".partial", dir=path.parent
         )
         temporary = Path(raw_path)
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+        with os.fdopen(fd, "wb") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
