@@ -165,6 +165,14 @@ olmayan ilk kademede durur:
 3. Otomatik iz, tam eşleşme
 4. Otomatik iz, aynı temel dil
 
+Makine çevirisi izler, kademeler değerlendirilmeden önce elenir. YouTube,
+otomatik transkripsiyonunun çevirilerini ~150 dil için yayımlar; bunlar altyazı
+URL'sindeki `tlang=` ile ayırt edilir. Bir transkripsiyonun çevirisi, yerel
+transkripsiyondan daha kötüdür; bu yüzden *hiç iz olmaması*nın da altında
+sıralanır ve `transcribe`'ın Whisper'a düşmesini sağlar. `--allow-translated`
+ile geri açılır; `SubtitleService.translated_matches` CLI'nin bu geri düşüşü
+açıklamasını sağlar.
+
 Bir kademe içinde eşitlik durumunda önce düz temel kod (`ar-EG` yerine `ar`),
 sonra alfabetik sıra tercih edilir. Dil kodları önce normalize edilir
 ([app/utils/language_utils.py](../app/utils/language_utils.py)): `_` → `-`, dil
@@ -179,8 +187,9 @@ olur. Bozuk kodlar hata fırlatmak yerine `None` döner ve atlanır.
 incele → iz seç → yalnızca o izi indir → ayrıştır → son işleme → dışa aktar
 ```
 
-Altyazı indirmesi bir `TemporaryDirectory` içinde, `subtitlesformat: "vtt/best"`
-ve `subtitleslangs: [track.language_code]` ile yapılır; `track.is_automatic`
+Altyazı indirmesi bir `TemporaryDirectory` içinde,
+`subtitlesformat: "json3/vtt/best"` ve `subtitleslangs: [track.language_code]`
+ile yapılır; `track.is_automatic`
 değerine göre `writesubtitles` / `writeautomaticsub` seçeneklerinden tam olarak
 biri açılır. Oluşan dosya `utf-8-sig` (BOM toleranslı) ile okunur ve bir
 `RawSubtitle` döndürülür.
@@ -196,6 +205,13 @@ biri açılır. Oluşan dosya `utf-8-sig` (BOM toleranslı) ile okunur ve bir
   zamanlama `tStartMs` + `dDurationMs` ile kurulur.
 
 Bunların dışındaki her şey `SubtitleParseError` fırlatır.
+
+**json3 neden önce isteniyor.** YouTube'un otomatik VTT'si kayan (karaoke)
+bir formattır: her cue bir önceki satırı tekrarlar ve sonrakini ekler. Ölçülen
+bir örnekte aynı iz için VTT 226 cue / 2322 kelime üretirken json3 114 cue / 780
+kelime üretti; ayrıca VTT ilk ifadenin gerçek başlangıcını da kaybediyordu
+(7.230 sn yerine 5.200 sn). json3 ifade başına tek cue taşır ve onarım
+gerektirmez. json3 sunmayan izler için VTT yedek olarak kalır.
 
 `--no-postprocess` ile bunun yerine asgari bir temizlik yolu çalışır
 (`_clean_segments`): işaretleme temizlenir, ardışık birebir tekrarlar atılır,
@@ -265,7 +281,21 @@ Tek başına `prepare-audio`, eşleşen bir altyazı varsa `--force` olmadan
   `cuda`, değilse `cpu`. GPU yokken açıkça `cuda` istenirse sessizce düşmek
   yerine `CudaUnavailableError` fırlatılır.
 - Hesaplama tipi: `auto` → CUDA'da `float16`, CPU'da `int8`.
-- VAD varsayılan olarak açıktır, `min_silence_duration_ms=500`.
+- VAD varsayılan olarak açıktır (`min_silence_duration_ms=500`); ayrıca
+  `threshold` ve `speech_pad_ms` yapılandırılabilir (yetersiz dolgu kelime
+  başlangıçlarını kırpar).
+- **Uzun kayıt çözümleme korumaları** dışa açıldı ve iletiliyor:
+  `condition_on_previous_text` burada motorun `true` varsayılanının aksine
+  **false**'tur; çünkü çözülen metni pencereler arasında taşımak, saatlerce
+  süren seslerde tekrar döngülerinin başlıca nedenidir.
+  `compression_ratio_threshold`, `log_prob_threshold` ve `no_speech_threshold`
+  motorun bozulma korumalarıdır; `hallucination_silence_threshold` isteğe
+  bağlıdır ve kelime zaman damgası gerektirir — ayarlandığında adaptör bunu
+  sizin için açar.
+- `initial_prompt` (CLI'de `--prompt`) çözücüye beklenen kelime dağarcığını verir.
+- **Kelime zaman damgaları** varsayılan olarak açıktır. Her kelimenin başlangıcı,
+  bitişi ve olasılığı donmuş bir `WordTiming`'e çevrilip segmentte taşınır;
+  son işlemenin bununla ne yaptığı için §8'e bakın.
 - İptal, model yüklemesinden önce ve üretilen her segmentte kontrol edilir.
 - Motor nesneleri dışarı sızmaz: segmentler döngü içinde donmuş
   `TranscriptionSegment` modellerine çevrilir, üreteç kapatılır ve GPU belleğini
@@ -299,9 +329,11 @@ atılır. Noktalama boşlukları normalize edilir — `، ؛ ؟ , . ! ? : ; ٪ %
 işaretlerinden önceki boşluk silinir, sonrasına boşluk eklenir; **ancak**
 rakamlar arasında bu yapılmaz, böylece `3.14` ve `1,000` korunur. Hareke
 temizliği, elif/ya normalizasyonu ve Arap-Hint rakam dönüşümü **varsayılan olarak
-kapalıdır**; siz istemedikçe konuşmacının harflerine dokunulmaz. Ardından ≥2
-kelimelik bitişik tekrar eden ifadeler sadeleştirilir
-(`_collapse_repeated_phrase`). Tanınan bir sessizlik cue'su (music/applause/
+kapalıdır**; siz istemedikçe konuşmacının harflerine dokunulmaz. ≥2 kelimelik
+bitişik tekrar eden ifadelerin sadeleştirilmesi
+(`_collapse_repeated_phrase`) de `collapse_repeated_phrases` ile **isteğe
+bağlıdır** — bir Whisper tekrar döngüsünü, Arap hitabetinin sürekli kullandığı
+kasıtlı retorik tekrardan ayırt edemez. Tanınan bir sessizlik cue'su (music/applause/
 silence/موسيقى/تصفيق/صمت) yalnızca `no_speech_probability ≥ 0.9` ise atılır.
 
 **2. Tekrar temizliği**
@@ -310,8 +342,8 @@ anahtar üzerinden karşılaştırılır. Birebir aynıysa → önceki segmentin
 uzatılır ve yenisi atılır. Aksi hâlde
 `SequenceMatcher.ratio() ≥ duplicate_detection_threshold` (0.9) veya tespit
 edilen bir baş-ifade örtüşmesi düzeltmeyi tetikler: tekrar eden baş ifade
-mevcut metinden kırpılır ya da — mevcut metin daha uzun değilse — önceki
-segmente soğurulur. YouTube otomatik altyazılarının tipik kayan tekrar
+mevcut metinden kırpılır ya da — mevcut cue tamamen bir öncekinin içinde
+kalıyorsa — soğurulup bitiş zamanı uzatılır. YouTube otomatik altyazılarının tipik kayan tekrar
 artefaktını ortadan kaldıran mekanizma budur.
 
 **3. Zamanlama onarımı (1. geçiş, asgari süre uygulanmadan)**
@@ -328,10 +360,27 @@ metin zaten bir cümle sonu (`. ! ? ؟ ؛ …`) ile bitmiyor.
 
 **5. Uzun segmentleri bölme**
 Hem karakter bütçesine hem `maximum_subtitle_duration`'a göre bölünür; sınırın
-yarısı geçildikten sonra cümle sonları tercih edilir. Yeni zamanlamalar
-`distribute_duration` ile üretilir; aralık, parça uzunluğuyla orantılı olarak
-kümülatif sınırlarla paylaştırılır — böylece parçalar bitişik olur, kayan nokta
-kaynaklı boşluk veya çakışma oluşmaz.
+yarısı geçildikten sonra cümle sonları tercih edilir.
+
+Yeni zamanlamalar, bir **kelime hizalaması** varsa ve tüm belirteçler birebir
+örtüşüyorsa oradan gelir (`_aligned_timings`): her parça ilk kelimesinin
+başlangıcını ve son kelimesinin bitişini alır; böylece cue tam olarak kelimeler
+söylendiğinde görünür ve gerçek bir duraklama boş kalır. Hizalama yoksa —
+indirilen altyazılar ya da temizliğin değiştirdiği metin — `distribute_duration`
+devreye girer ve aralığı parça uzunluğuyla orantılı paylaştırır.
+
+Fark büyüktür. Konuşmacının ortasında dört saniye duraksadığı
+"بسم الله الرحمن الرحيم" cue'su için:
+
+| | birinci cue | ikinci cue |
+|---|---|---|
+| kelime hizalı | 0.000 → 1.000 | 5.000 → 6.000 |
+| orantısal | 0.000 → 2.667 | 2.667 → 7.000 |
+
+Orantısal bölme, ikinci satırı kimse söylemeden 2,3 sn önce gösteriyor.
+Metin temizliği, tekrar ayıklama veya birleştirme belirteç sayısını
+değiştirdiğinde hizalamalar tahmin edilmez, **düşürülür**; böylece uyumsuzluk
+metni yanlış yerleştirmek yerine eski davranışa geriler.
 
 **6. Zamanlama onarımı (2. geçiş, asgari süre uygulanır)** ve ardından **satır
 sarma**
@@ -358,7 +407,12 @@ komutu ise elinizde zaten olan bir dosyaya uygulanan son işlemedir.
    `NUL`, `COM1`…) video kimliğine düşülür. Arapça, Türkçe ve diğer Unicode
    karakterler kasten korunur.
 4. **Tüm** hedef yolların varlığı, render işleminden *önce* kontrol edilir.
-   `--overwrite` yoksa komut hiçbir şey yazmadan durur.
+   `--overwrite` yoksa `available_stem`, istenen *her* uzantının boş olduğu ilk
+   indekse ilerler; böylece set tek bir gövdede kalır (`title (2).srt` **ve**
+   `title (2).vtt`), indeksler karışmaz. Var olan dosyalar asla değiştirilmez ve
+   asla hata verdirmez; tamamlanmış bir transkripsiyonu isim çakışmasına kurban
+   etmek daha kötü bir sonuçtur. `--overwrite` özgün adı koruyup dosyayı yerinde
+   değiştirir. Arama 1000 denemeyle sınırlıdır.
 5. İçerikler bellekte üretilir, toplam UTF-8 bayt boyutu boş disk alanına karşı
    kontrol edilir, sonra her dosya `atomic_write_text` ile yazılır: aynı dizinde
    `mkstemp` → yaz → `flush` → `os.fsync` → `Path.replace`. Bir okuyucu asla
@@ -471,10 +525,12 @@ yok; agresif yazım/dilbilgisi yeniden yazımı yok.
 
 Mevcut koddaki, bilinmesinde fayda olan pürüzler:
 
-- `prepare-audio` hâlâ "Transcription will be implemented in Phase 5" yazıyor ve
-  `extract`, eşleşen altyazı bulunmadığında transkripsiyon yedeğinin "will be
-  added in a later phase" olduğunu söylüyor. İkisi de bayat — `transcribe` bunu
-  bugün zaten yapıyor.
+- `prepare-audio` hâlâ "Transcription will be implemented in Phase 5" yazıyor.
+  Bayat bir mesaj — `transcribe` bunu bugün zaten yapıyor.
+- yt-dlp, `quiet: True` olmasına rağmen altyazı indirme sırasında kendi
+  `[download]` ilerleme ve `ERROR:` satırlarını doğrudan terminale yazıyor. Bu,
+  "ham yt-dlp metni asla stdout'a ulaşmaz" güvencesiyle çelişiyor; `noprogress`
+  ayarlanmamış.
 - `FFmpegAdapter.build_conversion_command` içinde
   `codec = "pcm_s16le" if … else "pcm_s16le"` şeklinde bir dal var;
   `audio_format` yalnızca dosya uzantısını etkiliyor.

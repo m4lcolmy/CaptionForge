@@ -23,7 +23,13 @@ class VideoService:
         self._subtitle_service = subtitle_service
         self._config = config or Config()
 
-    def inspect(self, url: str, preferred_language: str) -> SubtitleDiscoveryResult:
+    def inspect(
+        self,
+        url: str,
+        preferred_language: str,
+        *,
+        allow_translated: bool = False,
+    ) -> SubtitleDiscoveryResult:
         """Inspect one non-live YouTube video without downloading content."""
         log = get_logger()
         log.info("Inspecting input URL: {}", url)
@@ -49,4 +55,5 @@ class VideoService:
             inspection.manual_tracks,
             inspection.automatic_tracks,
             preferred_language,
+            allow_translated=allow_translated,
         )

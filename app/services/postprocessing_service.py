@@ -9,6 +9,7 @@ from difflib import SequenceMatcher
 
 from app.core.config import Config
 from app.models.subtitle import SubtitleSegment
+from app.models.transcription import WordTiming
 from app.utils.arabic_text_utils import clean_caption_text, comparison_key
 from app.utils.time_utils import distribute_duration
 
@@ -28,6 +29,7 @@ class _Item:
     speaker: str | None = None
     confidence: float | None = None
     no_speech_probability: float | None = None
+    words: tuple[WordTiming, ...] = ()
 
 
 class PostProcessingService:
@@ -49,6 +51,7 @@ class PostProcessingService:
                 item.speaker,
                 item.confidence,
                 item.no_speech_probability,
+                item.words,
             )
             for item in segments
         ]
@@ -81,6 +84,7 @@ class PostProcessingService:
                 speaker=item.speaker,
                 confidence=item.confidence,
                 no_speech_probability=item.no_speech_probability,
+                words=item.words,
             )
             for index, item in enumerate(items, 1)
         )
@@ -96,20 +100,27 @@ class PostProcessingService:
             )
             if not text:
                 continue
-            text = self._collapse_repeated_phrase(text)
+            if self.config.collapse_repeated_phrases:
+                text = self._collapse_repeated_phrase(text)
             if (
                 item.no_speech_probability is not None
                 and item.no_speech_probability >= 0.9
                 and _SAFE_SILENCE_CUE.fullmatch(text)
             ):
                 continue
+            if len(item.words) != len(text.split()):
+                item.words = ()
             item.text = text
             result.append(item)
         return result
 
     @staticmethod
     def _collapse_repeated_phrase(text: str) -> str:
-        """Collapse an adjacent repeated phrase of two or more words."""
+        """Collapse an adjacent repeated phrase of two or more words.
+
+        Opt-in (``collapse_repeated_phrases``): deliberate rhetorical repetition
+        is common in speech, and this cannot tell it apart from an artifact.
+        """
         words = text.split()
         for size in range(len(words) // 2, 1, -1):
             index = 0
@@ -143,6 +154,12 @@ class PostProcessingService:
                 or overlap is not None
             ):
                 if overlap:
+                    kept = len(overlap.split())
+                    item.words = (
+                        item.words[-kept:]
+                        if len(item.words) == len(item.text.split())
+                        else ()
+                    )
                     item.text = overlap
                 elif len(item.text) <= len(previous.text):
                     previous.end = max(previous.end, item.end)
@@ -152,15 +169,19 @@ class PostProcessingService:
 
     @staticmethod
     def _phrase_overlap(previous: str, current: str) -> str | None:
-        """Remove a repeated leading phrase only when at least two words match."""
+        """Remove a repeated leading phrase only when at least two words match.
+
+        Returns the trimmed remainder, an empty string when the current cue is
+        fully contained in the previous one (caller absorbs it), or None when
+        there is no overlap at all.
+        """
         left, right = previous.split(), current.split()
         maximum = min(len(left), len(right))
         for size in range(maximum, 1, -1):
             if [word.casefold() for word in left[-size:]] == [
                 word.casefold() for word in right[:size]
             ]:
-                remainder = right[size:]
-                return " ".join(remainder) if remainder else None
+                return " ".join(right[size:])
         return None
 
     def _repair_timing(
@@ -178,7 +199,13 @@ class PostProcessingService:
                 self.config.minimum_subtitle_duration if enforce_duration else 0.001
             )
             item.end = max(item.end, item.start + minimum)
-            item.end = min(item.end, item.start + self.config.maximum_subtitle_duration)
+            if enforce_duration:
+                # Only clamp once _split_long has had the true duration to work
+                # with. Clamping earlier truncates a long utterance instead of
+                # splitting it, dropping the tail of its timing.
+                item.end = min(
+                    item.end, item.start + self.config.maximum_subtitle_duration
+                )
             result.append(item)
         for index in range(len(result) - 1):
             if result[index].end > result[index + 1].start:
@@ -210,6 +237,11 @@ class PostProcessingService:
                     and not _SENTENCE_END.search(previous.text)
                 )
                 if should_merge:
+                    previous.words = (
+                        previous.words + item.words
+                        if previous.words and item.words
+                        else ()
+                    )
                     previous.text = combined
                     previous.end = min(
                         max(previous.end, item.end),
@@ -232,10 +264,13 @@ class PostProcessingService:
             if target_parts > len(parts):
                 target_length = max(1, len(item.text) // target_parts)
                 parts = self._text_parts(item.text, target_length)
-            timings = distribute_duration(
+            aligned = self._aligned_timings(item, parts)
+            timings = aligned or distribute_duration(
                 item.start, item.end, [max(1, len(part)) for part in parts]
             )
+            offset = 0
             for part, (start, end) in zip(parts, timings, strict=True):
+                count = len(part.split())
                 result.append(
                     _Item(
                         start,
@@ -245,9 +280,36 @@ class PostProcessingService:
                         item.speaker,
                         item.confidence,
                         item.no_speech_probability,
+                        item.words[offset : offset + count] if aligned else (),
                     )
                 )
+                offset += count
         return result
+
+    @staticmethod
+    def _aligned_timings(
+        item: _Item, parts: list[str]
+    ) -> list[tuple[float, float]] | None:
+        """Cut on real word boundaries when the engine aligned every token.
+
+        Falls back to proportional distribution whenever the alignment and the
+        cleaned text disagree, so a mismatch degrades instead of misplacing text.
+        """
+        if not item.words or len(item.words) != len(item.text.split()):
+            return None
+        timings: list[tuple[float, float]] = []
+        offset = 0
+        for part in parts:
+            chunk = item.words[offset : offset + len(part.split())]
+            if not chunk:
+                return None
+            start = min(max(item.start, chunk[0].start_seconds), item.end)
+            if timings and start < timings[-1][1]:
+                start = timings[-1][1]
+            end = max(min(item.end, chunk[-1].end_seconds), start + 0.001)
+            timings.append((start, end))
+            offset += len(part.split())
+        return timings if offset == len(item.words) else None
 
     @staticmethod
     def _text_parts(text: str, limit: int) -> list[str]:

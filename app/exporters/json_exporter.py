@@ -17,6 +17,8 @@ def render_json(
         "video": video.model_dump(mode="json"),
         "selected_language": track.normalized_language_code,
         "caption_source_type": track.source_type.value,
-        "segments": [segment.model_dump(mode="json") for segment in segments],
+        "segments": [
+            segment.model_dump(mode="json", exclude={"words"}) for segment in segments
+        ],
     }
     return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"

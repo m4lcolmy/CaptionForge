@@ -7,7 +7,7 @@ from app.models.subtitle import (
     SubtitleSourceType,
     SubtitleTrack,
 )
-from app.models.transcription import TranscriptionSegment
+from app.models.transcription import TranscriptionSegment, WordTiming
 from app.models.video import VideoMetadata
 
 __all__ = [
@@ -19,4 +19,5 @@ __all__ = [
     "SubtitleTrack",
     "TranscriptionSegment",
     "VideoMetadata",
+    "WordTiming",
 ]

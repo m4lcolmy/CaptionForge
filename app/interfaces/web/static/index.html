@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>CaptionForge</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<header class="bar">
+  <span class="mark" aria-hidden="true"></span>
+  <h1>CaptionForge</h1>
+  <span class="bar-meta" id="meta"></span>
+</header>
+
+<main>
+
+  <form class="source" id="source-form" autocomplete="off">
+    <input
+      id="url"
+      name="url"
+      type="url"
+      required
+      placeholder="Paste a YouTube video link"
+      spellcheck="false"
+      aria-label="YouTube video link">
+    <button type="submit" class="btn-ghost" id="inspect-btn">Look up</button>
+  </form>
+
+  <p class="note" id="hint">CaptionForge reuses the video's own captions when there
+    are any, and transcribes the audio on this computer when there aren't.</p>
+
+  <section class="alert" id="alert" hidden role="alert">
+    <strong id="alert-title">Something went wrong</strong>
+    <span id="alert-body"></span>
+  </section>
+
+  <section class="video" id="video" hidden>
+    <img id="thumb" alt="" width="160" height="90" referrerpolicy="no-referrer">
+    <div class="video-text">
+      <h2 id="title" dir="auto"></h2>
+      <p class="muted" id="byline"></p>
+    </div>
+  </section>
+
+  <section id="tracks" hidden>
+    <h3 class="label">Caption tracks</h3>
+    <ul class="chips" id="track-list"></ul>
+    <p class="note" id="selection"></p>
+  </section>
+
+  <section class="controls" id="controls" hidden>
+    <div class="field">
+      <label class="label" for="language">Language</label>
+      <input id="language" type="text" size="6" spellcheck="false">
+    </div>
+
+    <div class="field grow">
+      <span class="label" id="formats-label">Formats</span>
+      <ul class="chips" id="formats" role="group" aria-labelledby="formats-label"></ul>
+    </div>
+
+    <details class="options" id="options-panel">
+      <summary>Options</summary>
+      <div class="options-grid">
+        <label class="opt"><input type="checkbox" id="force"> Always transcribe, ignore existing captions</label>
+        <label class="opt"><input type="checkbox" id="allow-translated"> Accept machine-translated tracks</label>
+        <label class="opt"><input type="checkbox" id="timestamped-txt"> Timestamps in the TXT file</label>
+        <label class="opt"><input type="checkbox" id="overwrite"> Replace files instead of numbering them</label>
+        <label class="opt"><input type="checkbox" id="postprocess" checked> Clean and reflow the subtitles</label>
+        <label class="opt"><input type="checkbox" id="keep-audio"> Keep the prepared audio</label>
+        <fieldset class="radios">
+          <legend class="label">Whisper model</legend>
+          <div class="radio-list" id="models"></div>
+          <input id="model-custom" type="text" spellcheck="false" hidden
+                 aria-label="Custom model name or folder"
+                 placeholder="Model name or folder, e.g. tarteel-ai/whisper-base-ar-quran">
+          <p class="help">Only used when the video has no caption track to reuse.
+            Bigger models are more accurate and slower, and each one downloads
+            once the first time you pick it.</p>
+        </fieldset>
+
+        <fieldset class="radios">
+          <legend class="label">Device</legend>
+          <div class="radio-list">
+            <label class="radio">
+              <input type="radio" name="device" value="auto" checked>
+              <span><b>Automatic</b><em>Graphics card when it works, otherwise the processor</em></span>
+            </label>
+            <label class="radio">
+              <input type="radio" name="device" value="cuda" id="device-cuda">
+              <span><b>Graphics card</b><em id="cuda-note">NVIDIA CUDA</em></span>
+            </label>
+            <label class="radio">
+              <input type="radio" name="device" value="cpu">
+              <span><b>Processor</b><em>Slower, but always available</em></span>
+            </label>
+          </div>
+        </fieldset>
+
+        <div class="field-block">
+          <label class="label" for="prompt">Names and spellings</label>
+          <input id="prompt" type="text"
+                 placeholder="Speaker names, places, recurring terms">
+          <p class="help">Whisper reads this before it listens, so unusual words
+            come out spelled the way you write them here. Write the names as you
+            want them to appear, separated by commas. It is a hint, not a filter:
+            nothing is dropped for being absent from the list.</p>
+        </div>
+      </div>
+    </details>
+
+    <button type="button" class="btn-go" id="run">Get captions</button>
+  </section>
+
+  <section class="progress" id="progress" hidden aria-live="polite">
+    <div class="progress-head">
+      <span id="stage">Starting</span>
+      <span class="pct" id="pct">0%</span>
+    </div>
+    <div class="track"><div class="fill" id="fill"></div></div>
+    <button type="button" class="btn-quiet" id="cancel">Cancel</button>
+  </section>
+
+  <section class="results" id="results" hidden>
+    <h3 class="label" id="results-label">Done</h3>
+    <ul class="files" id="files"></ul>
+    <p class="note" id="results-note"></p>
+  </section>
+
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

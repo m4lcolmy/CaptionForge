@@ -164,7 +164,9 @@ class WorkflowVideoService:
     def __init__(self, discovery: SubtitleDiscoveryResult) -> None:
         self.discovery = discovery
 
-    def inspect(self, _url: str, _language: str) -> SubtitleDiscoveryResult:
+    def inspect(
+        self, _url: str, _language: str, *, allow_translated: bool = False
+    ) -> SubtitleDiscoveryResult:
         return self.discovery
 
 
@@ -283,3 +285,114 @@ def test_workflow_cancellation(tmp_path: Path, video_metadata: Any) -> None:
     with pytest.raises(TranscriptionCancelledError):
         service.process(VIDEO_URL, cancelled=lambda: True)
     assert audio.calls == 0
+
+
+def test_cuda_needs_loadable_libraries_not_just_a_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A driver reporting a GPU is not proof CUDA can run."""
+    monkeypatch.setattr(
+        WhisperAdapter, "cuda_device_present", staticmethod(lambda: True)
+    )
+    monkeypatch.setattr(
+        WhisperAdapter, "missing_cuda_libraries", staticmethod(lambda: ("cuBLAS",))
+    )
+    adapter = WhisperAdapter()
+
+    assert adapter.cuda_available() is False
+    # auto must fall back rather than pick a device that dies at inference
+    assert adapter.select_device("auto") == "cpu"
+
+
+def test_explicit_cuda_names_the_missing_library(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The message must say what to install instead of denying the GPU."""
+    monkeypatch.setattr(
+        WhisperAdapter, "cuda_device_present", staticmethod(lambda: True)
+    )
+    monkeypatch.setattr(
+        WhisperAdapter, "missing_cuda_libraries", staticmethod(lambda: ("cuBLAS",))
+    )
+
+    with pytest.raises(CudaUnavailableError) as caught:
+        WhisperAdapter().select_device("cuda")
+
+    assert "cuBLAS" in caught.value.message
+    assert "--device cpu" in caught.value.message
+
+
+def test_missing_cuda_library_is_not_reported_as_an_audio_fault() -> None:
+    """The old message blamed the audio for a device problem."""
+    with pytest.raises(CudaUnavailableError) as caught:
+        WhisperAdapter._translate_error(
+            RuntimeError("Library libcublas.so.12 is not found or cannot be loaded"),
+            loading=False,
+        )
+
+    assert "--device cpu" in caught.value.message
+
+
+def test_preload_is_a_no_op_without_the_nvidia_wheels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A machine with no pip CUDA wheels must not error during detection."""
+    from app.adapters import whisper_adapter
+
+    monkeypatch.setattr(whisper_adapter, "_cuda_preload_done", False)
+
+    def missing(name: str) -> object:
+        raise ImportError(name)
+
+    monkeypatch.setattr(whisper_adapter.importlib, "import_module", missing)
+    whisper_adapter._preload_bundled_cuda_libraries()
+
+
+def test_preload_loads_bundled_libraries_by_absolute_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """pip installs these where the loader cannot see them, so use full paths."""
+    from app.adapters import whisper_adapter
+
+    lib = tmp_path / "cublas" / "lib"
+    lib.mkdir(parents=True)
+    (lib / "libcublas.so.12").write_bytes(b"")
+    (lib / "libcublasLt.so.12").write_bytes(b"")
+
+    class FakeNvidia:
+        __path__ = [str(tmp_path)]
+
+    loaded: list[str] = []
+    monkeypatch.setattr(whisper_adapter, "_cuda_preload_done", False)
+    monkeypatch.setattr(
+        whisper_adapter.importlib, "import_module", lambda name: FakeNvidia
+    )
+    monkeypatch.setattr(
+        whisper_adapter.ctypes, "CDLL", lambda path, mode=0: loaded.append(str(path))
+    )
+    whisper_adapter._preload_bundled_cuda_libraries()
+
+    assert [Path(entry).name for entry in loaded] == [
+        "libcublasLt.so.12",
+        "libcublas.so.12",
+    ]
+    assert all(Path(entry).is_absolute() for entry in loaded)
+
+
+def test_preload_runs_only_once_per_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.adapters import whisper_adapter
+
+    calls: list[str] = []
+    monkeypatch.setattr(whisper_adapter, "_cuda_preload_done", False)
+    monkeypatch.setattr(
+        whisper_adapter.importlib,
+        "import_module",
+        lambda name: calls.append(name) or _raise_import(name),
+    )
+    whisper_adapter._preload_bundled_cuda_libraries()
+    whisper_adapter._preload_bundled_cuda_libraries()
+    assert calls == ["nvidia"]
+
+
+def _raise_import(name: str) -> object:
+    raise ImportError(name)

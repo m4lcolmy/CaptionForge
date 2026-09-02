@@ -15,6 +15,7 @@ from app.models.subtitle import SubtitleSegment, SubtitleTrack
 from app.models.video import VideoMetadata
 from app.utils.file_utils import (
     atomic_write_bytes,
+    available_stem,
     ensure_disk_space,
     ensure_output_directory,
     sanitize_filename,
@@ -35,7 +36,13 @@ class ExportService:
         timestamped_txt: bool = False,
         overwrite: bool = False,
     ) -> tuple[Path, ...]:
-        """Write all requested formats, refusing accidental overwrites."""
+        """Write all requested formats without ever replacing existing output.
+
+        When the natural name is taken and ``overwrite`` was not requested, the
+        whole set moves to the next free ``title (n)`` variant rather than
+        failing — losing a finished transcription to a name clash is worse than
+        an unexpected filename.
+        """
         normalized = tuple(dict.fromkeys(item.lower() for item in formats))
         unknown = set(normalized) - SUPPORTED_OUTPUT_FORMATS
         if not normalized:
@@ -46,13 +53,9 @@ class ExportService:
             )
         directory = ensure_output_directory(output_directory)
         stem = sanitize_filename(video.title, fallback=video.video_id)
+        if not overwrite:
+            stem = available_stem(directory, stem, normalized)
         paths = tuple(directory / f"{stem}.{extension}" for extension in normalized)
-        existing = [path for path in paths if path.exists()]
-        if existing and not overwrite:
-            raise ExportError(
-                f"Output file already exists: {existing[0]}. "
-                "Use --overwrite to replace it."
-            )
         rendered: dict[str, Callable[[], str | bytes]] = {
             "srt": lambda: render_srt(segments),
             "vtt": lambda: render_vtt(segments),

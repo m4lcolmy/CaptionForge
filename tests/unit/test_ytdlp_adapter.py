@@ -1,16 +1,21 @@
 """Offline tests for yt-dlp metadata mapping and error translation."""
 
 from datetime import date
+from pathlib import Path
 
 import pytest
 from yt_dlp.utils import DownloadError
 
 from app.adapters.ytdlp_adapter import YtDlpAdapter
 from app.core.exceptions import (
+    AudioDownloadError,
+    AudioStreamForbiddenError,
     MetadataRetrievalError,
     PrivateVideoError,
+    SubtitleStreamForbiddenError,
     VideoUnavailableError,
 )
+from app.models.subtitle import SubtitleSourceType, SubtitleTrack
 from tests.conftest import VIDEO_ID, VIDEO_URL, FakeExtractor, extractor_factory
 
 
@@ -99,3 +104,71 @@ def test_generic_extractor_errors_are_translated() -> None:
 
     with pytest.raises(MetadataRetrievalError):
         adapter.inspect(VIDEO_ID, VIDEO_URL)
+
+
+class _FailingDownloader:
+    """Extractor that fails the download step with a given yt-dlp error."""
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+
+    def __call__(self, _options: dict[str, object]) -> "_FailingDownloader":
+        return self
+
+    def __enter__(self) -> "_FailingDownloader":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def extract_info(self, url: str, *, download: bool) -> dict[str, object]:
+        raise DownloadError(self.message)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "ERROR: unable to download video data: HTTP Error 403: Forbidden",
+        "ERROR: The page needs to be reloaded",
+        "ERROR: Sign in to confirm you're not a bot",
+        "ERROR: nsig extraction failed",
+    ],
+)
+def test_stale_extractor_audio_failures_are_not_retried(
+    message: str, tmp_path: Path
+) -> None:
+    """A refused stream needs an upgrade, so retrying must not be advertised."""
+    adapter = YtDlpAdapter(_FailingDownloader(message))
+
+    with pytest.raises(AudioStreamForbiddenError) as caught:
+        adapter.download_audio(VIDEO_ID, tmp_path)
+
+    assert caught.value.retryable is False
+    assert "yt-dlp" in caught.value.message
+
+
+def test_stale_extractor_caption_failures_are_not_retried() -> None:
+    """The same refusal on a caption track gets the same actionable message."""
+    adapter = YtDlpAdapter(_FailingDownloader("HTTP Error 403: Forbidden"))
+    track = SubtitleTrack(
+        language_code="ar",
+        normalized_language_code="ar",
+        source_type=SubtitleSourceType.AUTOMATIC,
+        is_automatic=True,
+    )
+
+    with pytest.raises(SubtitleStreamForbiddenError) as caught:
+        adapter.download_subtitle(VIDEO_ID, track)
+
+    assert caught.value.retryable is False
+
+
+def test_ordinary_audio_failures_stay_retryable(tmp_path: Path) -> None:
+    """Genuine transient failures must keep their retry behaviour."""
+    adapter = YtDlpAdapter(_FailingDownloader("ERROR: connection reset by peer"))
+
+    with pytest.raises(AudioDownloadError) as caught:
+        adapter.download_audio(VIDEO_ID, tmp_path)
+
+    assert not isinstance(caught.value, AudioStreamForbiddenError)
+    assert caught.value.retryable is True

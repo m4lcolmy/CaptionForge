@@ -3,6 +3,7 @@
 import os
 import platform
 import shutil
+import webbrowser
 from collections.abc import Callable
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
@@ -197,16 +198,26 @@ def doctor() -> None:
         except PackageNotFoundError:
             table.add_row("python-docx installed", "No")
             table.add_row("python-docx version", "Not available")
+        table.add_row("JavaScript runtime", _javascript_runtime_status())
         whisper = WhisperAdapter()
         cuda_available = whisper.cuda_available()
         recommended_device = "cuda" if cuda_available else "cpu"
         recommended_compute = WhisperAdapter.select_compute_type(
             "auto", recommended_device
         )
-        table.add_row("CUDA available", "Yes" if cuda_available else "No")
+        missing_cuda = WhisperAdapter.missing_cuda_libraries()
+        gpu_present = WhisperAdapter.cuda_device_present()
+        if cuda_available:
+            cuda_status = "Yes"
+        elif gpu_present and missing_cuda:
+            # A GPU the app cannot use is worth naming, not hiding behind "No".
+            cuda_status = f"No - {' and '.join(missing_cuda)} could not be loaded"
+        else:
+            cuda_status = "No"
+        table.add_row("CUDA available", cuda_status)
         table.add_row(
             "Detected GPU",
-            _detected_gpu_name() if cuda_available else "Not available",
+            _detected_gpu_name() if gpu_present else "Not available",
         )
         table.add_row("Recommended device", recommended_device)
         table.add_row("Recommended compute type", recommended_compute)
@@ -238,12 +249,19 @@ def inspect(
         "--json",
         help="Emit a stable JSON document only.",
     ),
+    allow_translated: bool = typer.Option(
+        False,
+        "--allow-translated",
+        help="Also consider YouTube machine-translated caption tracks.",
+    ),
 ) -> None:
     """Inspect video metadata and caption availability without downloading files."""
 
     def run(config: Config) -> None:
         preferred_language = language or config.default_language
-        result = _create_video_service().inspect(video_url, preferred_language)
+        result = _create_video_service().inspect(
+            video_url, preferred_language, allow_translated=allow_translated
+        )
         if json_output:
             console.print(result.model_dump_json(indent=2), markup=False)
         else:
@@ -268,6 +286,11 @@ def transcribe(
     ),
     compute_type: str | None = typer.Option(
         None, "--compute-type", help="Compute type such as auto, int8, or float16."
+    ),
+    prompt: str | None = typer.Option(
+        None,
+        "--prompt",
+        help="Vocabulary hint for Whisper, e.g. names and terms in the video.",
     ),
     formats: Annotated[
         list[str] | None,
@@ -297,6 +320,11 @@ def transcribe(
         False,
         "--no-postprocess",
         help="Export source segments without Phase 6 cleanup.",
+    ),
+    allow_translated: bool = typer.Option(
+        False,
+        "--allow-translated",
+        help="Also consider YouTube machine-translated caption tracks.",
     ),
 ) -> None:
     """Export existing captions or fall back to local faster-whisper."""
@@ -337,6 +365,8 @@ def transcribe(
             overwrite=overwrite,
             timestamped_txt=timestamped_txt,
             postprocess=not no_postprocess,
+            allow_translated=allow_translated,
+            initial_prompt=prompt,
             progress=report,
         )
         source = (
@@ -450,6 +480,11 @@ def extract(
         "--no-postprocess",
         help="Export source captions without Phase 6 cleanup.",
     ),
+    allow_translated: bool = typer.Option(
+        False,
+        "--allow-translated",
+        help="Also consider YouTube machine-translated caption tracks.",
+    ),
 ) -> None:
     """Download and export an existing YouTube caption track without media."""
 
@@ -460,13 +495,21 @@ def extract(
         adapter = YtDlpAdapter()
         subtitle_service = SubtitleService(config)
         discovery = VideoService(adapter, subtitle_service).inspect(
-            video_url, preferred
+            video_url, preferred, allow_translated=allow_translated
         )
         track = discovery.selected_track
         if track is None:
+            translated = SubtitleService.translated_matches(discovery)
+            if translated:
+                raise SubtitleDiscoveryError(
+                    f"Only machine-translated '{discovery.preferred_language}' "
+                    "captions are available, which are translations of an "
+                    "automatic transcription. Run 'captionforge transcribe' for "
+                    "better quality, or pass --allow-translated to export them."
+                )
             raise SubtitleDiscoveryError(
                 f"No captions matching '{discovery.preferred_language}' were found. "
-                "Transcription fallback will be added in a later phase."
+                "Run 'captionforge transcribe' to transcribe the audio locally."
             )
         segments = subtitle_service.retrieve_and_parse(
             adapter,
@@ -547,13 +590,54 @@ def clean(
             overwrite=overwrite,
         )
         generated = paths[0]
-        if generated != destination:
-            if destination.exists() and not overwrite:
-                raise SubtitleDiscoveryError(
-                    f"Output file already exists: {destination}. Use --overwrite."
-                )
+        if generated != destination and (overwrite or not destination.exists()):
             generated.replace(destination)
-        console.print(f"[bold green]Cleaned:[/bold green] {destination.resolve()}")
+            generated = destination
+        console.print(f"[bold green]Cleaned:[/bold green] {generated.resolve()}")
+
+    _run_with_config(run)
+
+
+@app.command()
+def web(
+    port: int = typer.Option(
+        0, "--port", help="Port to bind on 127.0.0.1; 0 chooses a free one."
+    ),
+    open_browser: bool = typer.Option(
+        True, "--open/--no-open", help="Open the page in your default browser."
+    ),
+) -> None:
+    """Serve the CaptionForge interface to a browser on this computer."""
+
+    def run(config: Config) -> None:
+        try:
+            import uvicorn
+
+            from app.interfaces.web.security import generate_token
+            from app.interfaces.web.server import HOST, create_app, find_free_port
+        except ImportError as exc:
+            raise ConfigurationError(
+                "The web interface needs extra packages. Install them with "
+                'pip install "captionforge[web]"',
+                details=str(exc),
+            ) from exc
+
+        selected_port = port or find_free_port()
+        token = generate_token()
+        url = f"http://{HOST}:{selected_port}/?t={token}"
+        application = create_app(config, token=token, port=selected_port)
+        console.print(
+            Panel(
+                f"[bold green]{url}[/bold green]\n\n"
+                "Downloading, conversion and transcription all run on this "
+                "computer.\nKeep this terminal open; press Ctrl+C to stop.",
+                title=f"{APP_NAME} is serving",
+                border_style="green",
+            )
+        )
+        if open_browser:
+            webbrowser.open(url)
+        uvicorn.run(application, host=HOST, port=selected_port, log_level="warning")
 
     _run_with_config(run)
 
@@ -606,6 +690,11 @@ def _render_inspection(result: SubtitleDiscoveryResult) -> None:
         console.print(
             "\n[yellow]No subtitle track matched the preferred language.[/yellow]"
         )
+        if SubtitleService.translated_matches(result):
+            console.print(
+                "[yellow]Machine-translated tracks were found but skipped; "
+                "use --allow-translated to include them.[/yellow]"
+            )
 
 
 def _render_tracks(
@@ -618,6 +707,7 @@ def _render_tracks(
     table.add_column("Language")
     table.add_column("Normalized Code")
     table.add_column("Source")
+    table.add_column("Translated")
     table.add_column("Formats")
     table.add_column("Selected")
     for track in tracks:
@@ -625,11 +715,12 @@ def _render_tracks(
             track.language_name or "Unknown",
             track.normalized_language_code,
             track.source_type.value.title(),
+            "Yes" if track.is_translated else "No",
             ", ".join(track.available_formats) or "Unknown",
             "✓" if track == selected else "",
         )
     if not tracks:
-        table.add_row("None", "—", "—", "—", "")
+        table.add_row("None", "—", "—", "—", "—", "")
     console.print(table)
 
 
@@ -662,6 +753,19 @@ def _is_writable_directory(directory: Path) -> bool:
         return directory.is_dir() and os.access(directory, os.W_OK)
     except OSError:
         return False
+
+
+def _javascript_runtime_status() -> str:
+    """Report the runtime yt-dlp needs for YouTube signature extraction."""
+    if shutil.which("deno"):
+        return "Yes (deno)"
+    for alternative in ("node", "bun"):
+        if shutil.which(alternative):
+            return (
+                f"{alternative} found, but yt-dlp enables only deno by default; "
+                "install deno if extraction starts failing"
+            )
+    return "No - install deno; yt-dlp has deprecated extraction without one"
 
 
 def _detected_gpu_name() -> str:

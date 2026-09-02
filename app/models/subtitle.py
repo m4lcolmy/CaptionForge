@@ -4,6 +4,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.models.transcription import WordTiming
 from app.models.video import VideoMetadata
 
 
@@ -24,6 +25,7 @@ class SubtitleTrack(BaseModel):
     language_name: str | None = None
     source_type: SubtitleSourceType
     is_automatic: bool
+    is_translated: bool = False
     available_formats: tuple[str, ...] = ()
     track_count: int = Field(default=0, ge=0)
 
@@ -54,6 +56,7 @@ class SubtitleSegment(BaseModel):
     speaker: str | None = None
     confidence: float | None = Field(default=None, ge=0, le=1)
     no_speech_probability: float | None = Field(default=None, ge=0, le=1)
+    words: tuple[WordTiming, ...] = ()
 
     @model_validator(mode="after")
     def validate_timing(self) -> "SubtitleSegment":

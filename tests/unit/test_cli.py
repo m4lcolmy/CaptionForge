@@ -56,7 +56,13 @@ class StubVideoService:
         self.result = result
         self.error = error
 
-    def inspect(self, url: str, preferred_language: str) -> SubtitleDiscoveryResult:
+    def inspect(
+        self,
+        url: str,
+        preferred_language: str,
+        *,
+        allow_translated: bool = False,
+    ) -> SubtitleDiscoveryResult:
         if self.error:
             raise self.error
         assert url == VIDEO_URL

@@ -39,6 +39,8 @@ class SubtitleService:
         manual_tracks: Sequence[SubtitleTrack],
         automatic_tracks: Sequence[SubtitleTrack],
         preferred_language: str,
+        *,
+        allow_translated: bool = False,
     ) -> SubtitleDiscoveryResult:
         """Select the best track and return a stable discovery result."""
         preferred = normalize_language_code(preferred_language)
@@ -47,13 +49,17 @@ class SubtitleService:
                 f"The preferred language code '{preferred_language}' is invalid."
             )
         selected, match_type = self.select_track(
-            manual_tracks, automatic_tracks, preferred
+            manual_tracks,
+            automatic_tracks,
+            preferred,
+            allow_translated=allow_translated,
         )
         reason = self._selection_reason(selected, match_type)
         get_logger().info(
-            "Subtitle selection: preferred_language={}; selected={}",
+            "Subtitle selection: preferred_language={}; selected={}; translated={}",
             preferred,
             selected.normalized_language_code if selected else "none",
+            selected.is_translated if selected else False,
         )
         return SubtitleDiscoveryResult(
             video=video,
@@ -69,11 +75,21 @@ class SubtitleService:
         manual_tracks: Sequence[SubtitleTrack],
         automatic_tracks: Sequence[SubtitleTrack],
         preferred_language: str,
+        *,
+        allow_translated: bool = False,
     ) -> tuple[SubtitleTrack | None, str | None]:
-        """Select using manual-exact, manual-base, auto-exact, auto-base priority."""
+        """Select using manual-exact, manual-base, auto-exact, auto-base priority.
+
+        Machine-translated tracks are excluded unless explicitly allowed: a
+        translation of an automatic transcription is worse than transcribing
+        locally, so ranking it below "no track" lets the caller fall back.
+        """
         preferred = normalize_language_code(preferred_language)
         if preferred is None:
             return None, None
+        if not allow_translated:
+            manual_tracks = [t for t in manual_tracks if not t.is_translated]
+            automatic_tracks = [t for t in automatic_tracks if not t.is_translated]
         preferred_base = base_language(preferred)
         priorities = (
             (manual_tracks, True, "exact"),
@@ -242,6 +258,19 @@ class SubtitleService:
         return tuple(cleaned)
 
     @staticmethod
+    def translated_matches(
+        discovery: SubtitleDiscoveryResult,
+    ) -> tuple[SubtitleTrack, ...]:
+        """Return machine-translated tracks that matched the preferred language."""
+        preferred_base = base_language(discovery.preferred_language)
+        return tuple(
+            track
+            for track in (*discovery.manual_tracks, *discovery.automatic_tracks)
+            if track.is_translated
+            and base_language(track.normalized_language_code) == preferred_base
+        )
+
+    @staticmethod
     def _selection_reason(
         track: SubtitleTrack | None, match_type: str | None
     ) -> str | None:
@@ -250,5 +279,7 @@ class SubtitleService:
         source = (
             "manual" if track.source_type is SubtitleSourceType.MANUAL else "automatic"
         )
+        if track.is_translated:
+            source = f"machine-translated {source}"
         name = track.language_name or track.normalized_language_code
         return f"Selected {source} {name} caption using a {match_type} match."

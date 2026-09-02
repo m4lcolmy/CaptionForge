@@ -68,6 +68,14 @@ class SubtitleDownloadError(SubtitleError):
         return True
 
 
+class SubtitleStreamForbiddenError(SubtitleDownloadError):
+    """Raised when YouTube refuses the caption track URL outright."""
+
+    @property
+    def retryable(self) -> bool:
+        return False
+
+
 class SubtitleParseError(SubtitleError):
     """Raised when downloaded subtitle data cannot be parsed."""
 
@@ -86,6 +94,16 @@ class AudioDownloadError(AudioError):
 
 class AudioFormatUnavailableError(AudioDownloadError):
     """Raised when YouTube provides no usable audio stream."""
+
+
+class AudioStreamForbiddenError(AudioDownloadError):
+    """Raised when YouTube refuses the audio stream URL outright."""
+
+    @property
+    def retryable(self) -> bool:
+        # A refused stream means the extractor can no longer read YouTube's
+        # signature scheme. Repeating the request cannot change that.
+        return False
 
 
 class FFmpegNotFoundError(AudioError):

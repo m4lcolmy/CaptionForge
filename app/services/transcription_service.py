@@ -78,6 +78,8 @@ class TranscriptionService:
         overwrite: bool = False,
         timestamped_txt: bool = False,
         postprocess: bool = True,
+        allow_translated: bool = False,
+        initial_prompt: str | None = None,
         progress: ProgressCallback | None = None,
         cancelled: CancelCallback | None = None,
     ) -> TranscriptionWorkflowResult:
@@ -94,7 +96,9 @@ class TranscriptionService:
         try:
             self._check_cancelled(is_cancelled)
             notify("Inspecting video", 5.0)
-            discovery = self._video_service.inspect(url, inspection_language)
+            discovery = self._video_service.inspect(
+                url, inspection_language, allow_translated=allow_translated
+            )
             track = discovery.selected_track
             requested_formats = formats or self._config.default_output_formats
             destination = output_directory or self._config.default_output_folder
@@ -173,6 +177,22 @@ class TranscriptionService:
                     vad_enabled=self._config.whisper_vad_enabled,
                     min_silence_duration_ms=(
                         self._config.whisper_min_silence_duration_ms
+                    ),
+                    vad_threshold=self._config.whisper_vad_threshold,
+                    vad_speech_pad_ms=self._config.whisper_vad_speech_pad_ms,
+                    condition_on_previous_text=(
+                        self._config.whisper_condition_on_previous_text
+                    ),
+                    initial_prompt=initial_prompt
+                    or self._config.whisper_initial_prompt,
+                    word_timestamps=self._config.whisper_word_timestamps,
+                    compression_ratio_threshold=(
+                        self._config.whisper_compression_ratio_threshold
+                    ),
+                    log_prob_threshold=self._config.whisper_log_prob_threshold,
+                    no_speech_threshold=self._config.whisper_no_speech_threshold,
+                    hallucination_silence_threshold=(
+                        self._config.whisper_hallucination_silence_threshold
                     ),
                     download_root=self._config.whisper_model_download_directory,
                     progress=report_transcription,
@@ -258,6 +278,7 @@ class TranscriptionService:
                 language=segment.language or result.detected_language,
                 confidence=segment.confidence,
                 no_speech_probability=segment.no_speech_probability,
+                words=segment.words,
             )
             for segment in result.segments
         )

@@ -106,33 +106,91 @@ def test_timestamped_txt(
     assert path.read_text(encoding="utf-8").startswith("[00:00:01.250]\t")
 
 
-def test_existing_file_requires_overwrite(
+def test_existing_output_gets_a_new_name_instead_of_failing(
     tmp_path: Path, video_metadata: object, segments: tuple[SubtitleSegment, ...]
 ) -> None:
+    """Losing finished work to a name clash is worse than an odd filename."""
     service = ExportService()
-    service.export(
-        video_metadata,
+
+    first = service.export(
+        video_metadata,  # type: ignore[arg-type]
         make_track("ar"),
         segments,
         ("srt",),
-        tmp_path,  # type: ignore[arg-type]
-    )
-    with pytest.raises(ExportError, match="already exists"):
-        service.export(
-            video_metadata,  # type: ignore[arg-type]
-            make_track("ar"),
-            segments,
-            ("srt",),
-            tmp_path,
-        )
-    service.export(
+        tmp_path,
+    )[0]
+    second = service.export(
+        video_metadata,  # type: ignore[arg-type]
+        make_track("ar"),
+        segments,
+        ("srt",),
+        tmp_path,
+    )[0]
+    third = service.export(
+        video_metadata,  # type: ignore[arg-type]
+        make_track("ar"),
+        segments,
+        ("srt",),
+        tmp_path,
+    )[0]
+
+    assert second.name == f"{first.stem} (2).srt"
+    assert third.name == f"{first.stem} (3).srt"
+    assert first.exists() and second.exists() and third.exists()
+
+
+def test_overwrite_still_replaces_in_place(
+    tmp_path: Path, video_metadata: object, segments: tuple[SubtitleSegment, ...]
+) -> None:
+    """--overwrite must reuse the original name, not accumulate variants."""
+    service = ExportService()
+    original = service.export(
+        video_metadata,  # type: ignore[arg-type]
+        make_track("ar"),
+        segments,
+        ("srt",),
+        tmp_path,
+    )[0]
+
+    again = service.export(
         video_metadata,  # type: ignore[arg-type]
         make_track("ar"),
         segments,
         ("srt",),
         tmp_path,
         overwrite=True,
+    )[0]
+
+    assert again == original
+    assert sorted(item.name for item in tmp_path.iterdir()) == [original.name]
+
+
+def test_multi_format_exports_share_one_stem(
+    tmp_path: Path, video_metadata: object, segments: tuple[SubtitleSegment, ...]
+) -> None:
+    """A clash in one format must move the whole set, not split the names."""
+    service = ExportService()
+    first = service.export(
+        video_metadata,  # type: ignore[arg-type]
+        make_track("ar"),
+        segments,
+        ("srt", "vtt"),
+        tmp_path,
     )
+    # Only the .srt is taken; the .vtt of the next index is still free.
+    first[1].unlink()
+
+    second = service.export(
+        video_metadata,  # type: ignore[arg-type]
+        make_track("ar"),
+        segments,
+        ("srt", "vtt"),
+        tmp_path,
+    )
+
+    stems = {path.stem for path in second}
+    assert len(stems) == 1
+    assert stems.pop().endswith(" (2)")
 
 
 def test_invalid_output_directory(

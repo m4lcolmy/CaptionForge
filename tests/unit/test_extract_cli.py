@@ -30,7 +30,9 @@ class StubVideoService:
     def __init__(self, adapter: object, subtitle_service: object) -> None:
         pass
 
-    def inspect(self, url: str, language: str) -> SubtitleDiscoveryResult:
+    def inspect(
+        self, url: str, language: str, *, allow_translated: bool = False
+    ) -> SubtitleDiscoveryResult:
         return self.result
 
 
@@ -90,4 +92,4 @@ def test_extract_no_matching_caption(
 
     assert result.exit_code == 1
     assert "No captions matching" in result.stderr
-    assert "later phase" in result.stderr
+    assert "transcribe" in result.stderr

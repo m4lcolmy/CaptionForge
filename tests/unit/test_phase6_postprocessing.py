@@ -13,6 +13,7 @@ from app.models.subtitle import (
     SubtitleSourceType,
     SubtitleTrack,
 )
+from app.models.transcription import WordTiming
 from app.services.postprocessing_service import PostProcessingService
 from app.services.subtitle_service import SubtitleService
 
@@ -48,15 +49,27 @@ def test_latin_punctuation_spacing_is_safe() -> None:
     assert result[0].text == "Hello, world! Version 3.14"
 
 
-def test_empty_exact_duplicates_and_repeated_whisper_phrases() -> None:
-    result = PostProcessingService().process_candidates(
-        [
-            (0, 1, " "),
-            (1, 2, "شكرا لكم شكرا لكم"),
-            (2, 3, "شكرا لكم"),
-        ],
-        "ar",
-    )
+def _repetition_candidates() -> list[tuple[float, float, str]]:
+    return [
+        (0, 1, " "),
+        (1, 2, "شكرا لكم شكرا لكم"),
+        (2, 3, "شكرا لكم"),
+    ]
+
+
+def test_empty_and_redundant_cues_are_removed_without_rewriting_speech() -> None:
+    """Blank and fully-contained cues go; repeated words are left alone."""
+    result = PostProcessingService().process_candidates(_repetition_candidates(), "ar")
+
+    assert [item.text for item in result] == ["شكرا لكم شكرا لكم"]
+
+
+def test_repeated_phrase_collapse_is_opt_in() -> None:
+    """Collapsing repetition rewrites speech, so it must be requested."""
+    service = PostProcessingService(Config(collapse_repeated_phrases=True))
+
+    result = service.process_candidates(_repetition_candidates(), "ar")
+
     assert [item.text for item in result] == ["شكرا لكم"]
 
 
@@ -152,3 +165,81 @@ def test_clean_command_supports_srt_and_vtt(
     assert result.exit_code == 0, result.output
     assert destination.exists()
     assert "مرحبا، بالعالم" in destination.read_text(encoding="utf-8")
+
+
+def _timed_words(count: int, step: float = 0.6) -> tuple[WordTiming, ...]:
+    """Words that run end to end, so the true speech end is unambiguous."""
+    return tuple(
+        WordTiming(
+            text=f"w{index}",
+            start_seconds=index * step,
+            end_seconds=index * step + step - 0.05,
+        )
+        for index in range(count)
+    )
+
+
+def test_long_utterance_is_split_not_truncated() -> None:
+    """A cue longer than the maximum must be divided, keeping its real end.
+
+    Clamping the end before _split_long ran left the caption ending seconds
+    before the speaker stopped, with the whole text crammed into one short cue.
+    """
+    words = _timed_words(20)
+    speech_ends = words[-1].end_seconds
+    source = SubtitleSegment(
+        index=1,
+        start_seconds=0.0,
+        end_seconds=12.0,
+        text=" ".join(word.text for word in words),
+        language="ar",
+        words=words,
+    )
+
+    result = PostProcessingService(Config()).process([source])
+
+    assert len(result) > 1
+    assert result[-1].end_seconds >= speech_ends
+    for cue in result:
+        assert cue.end_seconds - cue.start_seconds <= Config().maximum_subtitle_duration
+
+
+def test_split_cues_land_on_real_word_boundaries() -> None:
+    """Every boundary should match a word timing, not a character estimate."""
+    words = _timed_words(20)
+    source = SubtitleSegment(
+        index=1,
+        start_seconds=0.0,
+        end_seconds=12.0,
+        text=" ".join(word.text for word in words),
+        language="ar",
+        words=words,
+    )
+
+    result = PostProcessingService(Config()).process([source])
+    boundaries = {round(word.end_seconds, 2) for word in words}
+
+    assert round(result[0].end_seconds, 2) in boundaries
+
+
+def test_short_cue_ends_on_the_last_word_not_the_padded_segment() -> None:
+    """A cue within the limit stays whole and tightens onto real speech.
+
+    VAD padding leaves the engine's segment end slightly after the last word,
+    so snapping to the word boundary is the more accurate ending.
+    """
+    words = _timed_words(4)
+    source = SubtitleSegment(
+        index=1,
+        start_seconds=0.0,
+        end_seconds=2.4,
+        text=" ".join(word.text for word in words),
+        language="ar",
+        words=words,
+    )
+
+    result = PostProcessingService(Config()).process([source])
+
+    assert len(result) == 1
+    assert result[0].end_seconds == pytest.approx(words[-1].end_seconds)
+    assert result[0].end_seconds <= 2.4

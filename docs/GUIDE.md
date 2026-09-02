@@ -163,6 +163,13 @@ the first non-empty tier:
 3. Automatic track, exact match
 4. Automatic track, same base language
 
+Machine-translated tracks are excluded before any tier is considered. YouTube
+publishes translations of its automatic transcription for ~150 languages,
+identified by `tlang=` in the caption URL. A translation of a transcription is
+worse than transcribing locally, so it ranks below *no track at all* and lets
+`transcribe` fall through to Whisper. `--allow-translated` opts back in;
+`SubtitleService.translated_matches` lets the CLI explain the fallback.
+
 Within a tier, ties break by preferring the bare base code (`ar` over `ar-EG`),
 then alphabetically. Language codes are normalized first
 ([app/utils/language_utils.py](../app/utils/language_utils.py)): `_` → `-`,
@@ -178,7 +185,7 @@ inspect → select track → download that track only → parse → post-process
 ```
 
 The caption download uses a `TemporaryDirectory` with `subtitlesformat:
-"vtt/best"` and `subtitleslangs: [track.language_code]`, and sets exactly one of
+"json3/vtt/best"` and `subtitleslangs: [track.language_code]`, and sets exactly one of
 `writesubtitles` / `writeautomaticsub` based on `track.is_automatic`. It reads
 the resulting file with `utf-8-sig` (BOM-tolerant) and returns a `RawSubtitle`.
 
@@ -193,6 +200,13 @@ the resulting file with `utf-8-sig` (BOM-tolerant) and returns a `RawSubtitle`.
   `tStartMs` + `dDurationMs` as timing.
 
 Anything else raises `SubtitleParseError`.
+
+**Why json3 is requested first.** YouTube's automatic VTT is a rolling/karaoke
+format: each cue repeats the previous line and appends the next. On a measured
+sample it produced 226 cues / 2322 words against json3's 114 cues / 780 words
+for the identical track, and it also lost the true onset of the first phrase
+(7.230 s versus 5.200 s). json3 carries one cue per phrase and needs no repair.
+VTT remains the fallback for tracks that do not offer json3.
 
 With `--no-postprocess`, a minimal cleanup path runs instead
 (`_clean_segments`): markup stripped, exact consecutive duplicates dropped,
@@ -263,7 +277,19 @@ already made) and `keep_temp=True` (the caller owns cleanup, in its `finally`).
   else `cpu`. An explicit `cuda` with no GPU raises `CudaUnavailableError`
   rather than silently degrading.
 - Compute type: `auto` → `float16` on CUDA, `int8` on CPU.
-- VAD is on by default with `min_silence_duration_ms=500`.
+- VAD is on by default with `min_silence_duration_ms=500`, plus a configurable
+  `threshold` and `speech_pad_ms` (too little padding clips word onsets).
+- **Long-form decoding guards** are exposed and forwarded:
+  `condition_on_previous_text` defaults to **false** here, against the engine's
+  own `true`, because carrying decoded text between windows is the usual cause
+  of repetition loops on hour-long audio. `compression_ratio_threshold`,
+  `log_prob_threshold` and `no_speech_threshold` are the engine's degeneracy
+  guards; `hallucination_silence_threshold` is opt-in and implies word
+  timestamps, which the adapter turns on for you when you set it.
+- `initial_prompt` (CLI `--prompt`) seeds the decoder with expected vocabulary.
+- **Word timestamps** are on by default. Each word's start, end and probability
+  is converted to a frozen `WordTiming` and carried on the segment; see §8 for
+  what post-processing does with them.
 - Cancellation is checked before loading and on every produced segment.
 - Engine objects never escape: segments are converted to frozen
   `TranscriptionSegment` models inside the loop, the generator is closed, and
@@ -295,8 +321,10 @@ Punctuation spacing is normalized — space removed before `، ؛ ؟ , . ! ? : ;
 and added after, **except** between digits, so `3.14` and `1,000` survive.
 Diacritic removal, alef/ya normalization and Arabic-Indic digit conversion are
 all **off by default**; the letters the speaker said are not altered unless you
-ask. Then adjacent repeated phrases of ≥2 words are collapsed
-(`_collapse_repeated_phrase`). A recognized silence cue (music/applause/
+ask. Collapsing an adjacent repeated phrase of ≥2 words
+(`_collapse_repeated_phrase`) is also **opt-in** via `collapse_repeated_phrases`
+— it cannot distinguish a Whisper repetition loop from deliberate rhetorical
+repetition, which Arabic oratory uses constantly. A recognized silence cue (music/applause/
 silence/موسيقى/تصفيق/صمت) is dropped only if `no_speech_probability ≥ 0.9`.
 
 **2. Duplicate removal**
@@ -304,8 +332,8 @@ Compared against the previous segment only, using a case-folded cleaned key.
 Identical → previous segment's end is extended and the new one dropped.
 Otherwise `SequenceMatcher.ratio() ≥ duplicate_detection_threshold` (0.9) or a
 detected leading-phrase overlap triggers a fix: the repeated leading phrase is
-trimmed from the current text, or — if the current text is not longer — it is
-absorbed into the previous segment. This is what kills the rolling-repetition
+trimmed from the current text, or — if the current cue is fully contained in the
+previous one — it is absorbed and its end time extended. This is what kills the rolling-repetition
 artifact typical of YouTube auto-captions.
 
 **3. Timing repair (pass 1, no minimum duration)**
@@ -322,10 +350,27 @@ already end a sentence (`. ! ? ؟ ؛ …`).
 
 **5. Split long**
 Splits by character budget *and* by `maximum_subtitle_duration`, preferring
-sentence ends once past half the limit. New timings come from
-`distribute_duration`, which allocates the range proportionally to part length
-using cumulative boundaries — so parts are contiguous with no floating-point
-gaps or overlaps.
+sentence ends once past half the limit.
+
+New timings come from the engine's **word alignment** when one is available and
+every token lines up (`_aligned_timings`): each part takes the start of its
+first word and the end of its last, so a cue appears exactly when the words are
+spoken and a real pause stays empty. When there is no alignment — downloaded
+captions, or text that cleaning changed — it falls back to `distribute_duration`,
+which allocates the range proportionally to part length.
+
+The difference is large. One cue reading "بسم الله الرحمن الرحيم" whose speaker
+pauses four seconds in the middle:
+
+| | first cue | second cue |
+|---|---|---|
+| word-aligned | 0.000 → 1.000 | 5.000 → 6.000 |
+| proportional | 0.000 → 2.667 | 2.667 → 7.000 |
+
+The proportional split shows the second line 2.3 s before anyone says it.
+Alignments are dropped — never guessed — whenever text cleaning, de-duplication
+or merging changes the token count, so a mismatch degrades to the old behaviour
+instead of misplacing text.
 
 **6. Timing repair (pass 2, minimum duration enforced)** then **line wrapping**
 `_wrap` finds the word boundary that most evenly balances the two halves and
@@ -351,7 +396,13 @@ command is post-processing applied to a file you already have.
    Empty results or Windows reserved names (`CON`, `NUL`, `COM1`…) fall back to
    the video ID. Arabic, Turkish and other Unicode is deliberately preserved.
 4. **All** target paths are checked for existence *before* rendering. Without
-   `--overwrite`, the command aborts having written nothing.
+   `--overwrite`, `available_stem` walks forward to the first index at which
+   *every* requested extension is free, so the set stays on one stem
+   (`title (2).srt` **and** `title (2).vtt`) rather than mixing indices.
+   Existing files are never replaced and never cause a refusal; losing a
+   finished transcription to a name clash is the worse outcome. `--overwrite`
+   keeps the original name and replaces in place. The search is bounded at
+   1000 attempts.
 5. Contents are rendered in memory, the total UTF-8 byte size is checked against
    free disk space, then each file is written with `atomic_write_text`:
    `mkstemp` in the same directory → write → `flush` → `os.fsync` →
@@ -462,10 +513,11 @@ aggressive spelling or grammar rewriting.
 
 Rough edges in the current code, worth knowing:
 
-- `prepare-audio` still prints "Transcription will be implemented in Phase 5",
-  and `extract` still says the transcription fallback "will be added in a later
-  phase" when no caption matches. Both are stale — `transcribe` implements it
-  today.
+- `prepare-audio` still prints "Transcription will be implemented in Phase 5".
+  It is stale — `transcribe` implements it today.
+- yt-dlp writes its own `[download]` progress and `ERROR:` lines straight to the
+  terminal during caption download, despite `quiet: True`. This contradicts the
+  "raw yt-dlp text never reaches stdout" guarantee; `noprogress` is not set.
 - `FFmpegAdapter.build_conversion_command` has a `codec = "pcm_s16le" if … else
   "pcm_s16le"` branch; `audio_format` only affects the file extension.
 - `configure_logging`'s docstring mentions console and file handlers, but only

@@ -13,10 +13,12 @@ from yt_dlp.utils import DownloadError
 from app.core.exceptions import (
     AudioDownloadError,
     AudioFormatUnavailableError,
+    AudioStreamForbiddenError,
     CaptionForgeError,
     MetadataRetrievalError,
     PrivateVideoError,
     SubtitleDownloadError,
+    SubtitleStreamForbiddenError,
     VideoUnavailableError,
 )
 from app.core.logging_config import get_logger
@@ -129,12 +131,21 @@ class YtDlpAdapter:
                 "writesubtitles": not track.is_automatic,
                 "writeautomaticsub": track.is_automatic,
                 "subtitleslangs": [track.language_code],
-                "subtitlesformat": "vtt/best",
+                # json3 first: YouTube's VTT auto-captions are rolling/karaoke
+                # cues that repeat each line, which json3 does not do.
+                "subtitlesformat": "json3/vtt/best",
             }
             try:
                 with self._extractor_factory(options) as extractor:
                     extractor.extract_info(url, download=True)
             except DownloadError as exc:
+                if _is_extractor_stale(str(exc).lower()):
+                    raise SubtitleStreamForbiddenError(
+                        "YouTube refused the caption track. This normally means "
+                        "the installed yt-dlp is too old for YouTube's current "
+                        "site: upgrade it with 'pip install --upgrade yt-dlp'.",
+                        details=str(exc),
+                    ) from exc
                 raise SubtitleDownloadError(
                     "The selected YouTube caption track could not be downloaded.",
                     details=str(exc),
@@ -203,9 +214,17 @@ class YtDlpAdapter:
                     canonical_youtube_url(video_id), download=True
                 )
         except DownloadError as exc:
-            if "requested format is not available" in str(exc).lower():
+            message = str(exc).lower()
+            if "requested format is not available" in message:
                 raise AudioFormatUnavailableError(
                     "No downloadable audio stream is available for this video."
+                ) from exc
+            if _is_extractor_stale(message):
+                raise AudioStreamForbiddenError(
+                    "YouTube refused the audio stream. This normally means the "
+                    "installed yt-dlp is too old for YouTube's current site: "
+                    "upgrade it with 'pip install --upgrade yt-dlp' and retry.",
+                    details=str(exc),
                 ) from exc
             raise AudioDownloadError(
                 "The audio could not be downloaded. Please try again later.",
@@ -283,6 +302,14 @@ class YtDlpAdapter:
                     if isinstance(entry.get("ext"), str) and entry["ext"].strip()
                 }
             )
+            # YouTube offers machine translations of the ASR track for ~150
+            # languages; they carry tlang= in the caption URL. Their quality is
+            # far below both a real caption and local transcription.
+            urls = [
+                entry["url"]
+                for entry in valid_entries
+                if isinstance(entry.get("url"), str) and entry["url"].strip()
+            ]
             tracks.append(
                 SubtitleTrack(
                     language_code=code,
@@ -290,6 +317,7 @@ class YtDlpAdapter:
                     language_name=language_name(normalized),
                     source_type=source,
                     is_automatic=source is SubtitleSourceType.AUTOMATIC,
+                    is_translated=any("tlang=" in url for url in urls),
                     available_formats=tuple(formats),
                     track_count=len(valid_entries),
                 )
@@ -322,6 +350,22 @@ class YtDlpAdapter:
             "Check your internet connection and try again.",
             details=str(exc),
         )
+
+
+def _is_extractor_stale(message: str) -> bool:
+    """Recognize failures that an updated extractor, not a retry, resolves."""
+    return any(
+        marker in message
+        for marker in (
+            "403",
+            "forbidden",
+            "needs to be reloaded",
+            "confirm you're not a bot",
+            "please sign in",
+            "nsig extraction failed",
+            "unable to extract",
+        )
+    )
 
 
 def _parse_upload_date(value: Any) -> date | None:

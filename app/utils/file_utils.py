@@ -5,6 +5,7 @@ import re
 import shutil
 import tempfile
 import unicodedata
+from collections.abc import Sequence
 from contextlib import suppress
 from pathlib import Path
 from uuid import UUID
@@ -37,6 +38,31 @@ def sanitize_filename(title: str, *, fallback: str = "captions") -> str:
     if not value or value.upper() in _WINDOWS_NAMES:
         value = fallback
     return value
+
+
+def available_stem(
+    directory: Path,
+    stem: str,
+    extensions: Sequence[str],
+    *,
+    limit: int = 1000,
+) -> str:
+    """Return the first numbered variant of a stem that no format occupies.
+
+    One index must be free for every requested extension so that a multi-format
+    export keeps a single consistent name instead of mixing ``title.srt`` with
+    ``title (2).vtt``.
+    """
+    for index in range(1, limit + 1):
+        candidate = stem if index == 1 else f"{stem} ({index})"
+        if not any(
+            (directory / f"{candidate}.{extension}").exists()
+            for extension in extensions
+        ):
+            return candidate
+    raise ExportError(
+        f"Could not find an unused output name for '{stem}' after {limit} attempts."
+    )
 
 
 def ensure_output_directory(directory: Path) -> Path:

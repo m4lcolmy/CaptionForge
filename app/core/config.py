@@ -25,6 +25,17 @@ class Config(BaseModel):
     whisper_beam_size: int = Field(default=5, ge=1, le=100)
     whisper_vad_enabled: bool = True
     whisper_min_silence_duration_ms: int = Field(default=500, ge=0)
+    whisper_vad_threshold: float = Field(default=0.5, ge=0, le=1)
+    whisper_vad_speech_pad_ms: int = Field(default=400, ge=0)
+    # Engine default is True, which is the usual cause of repetition loops and
+    # drift on long recordings; long-form robustness is worth the lost context.
+    whisper_condition_on_previous_text: bool = False
+    whisper_initial_prompt: str | None = None
+    whisper_word_timestamps: bool = True
+    whisper_compression_ratio_threshold: float = Field(default=2.4, gt=0)
+    whisper_log_prob_threshold: float = -1.0
+    whisper_no_speech_threshold: float = Field(default=0.6, ge=0, le=1)
+    whisper_hallucination_silence_threshold: float | None = Field(default=None, ge=0)
     whisper_language: str | None = None
     whisper_model_download_directory: Path | None = None
     logging_level: str = "INFO"
@@ -42,6 +53,7 @@ class Config(BaseModel):
     subtitle_merge_threshold: float = Field(default=1.0, ge=0, le=10)
     duplicate_detection_threshold: float = Field(default=0.9, ge=0, le=1)
     remove_diacritics: bool = False
+    collapse_repeated_phrases: bool = False
     normalize_arabic_letters: bool = False
     normalize_arabic_indic_digits: bool = False
     retry_count: int = Field(default=3, ge=1, le=10)
@@ -58,6 +70,15 @@ class Config(BaseModel):
             "whisper_beam_size",
             "whisper_vad_enabled",
             "whisper_min_silence_duration_ms",
+            "whisper_vad_threshold",
+            "whisper_vad_speech_pad_ms",
+            "whisper_condition_on_previous_text",
+            "whisper_initial_prompt",
+            "whisper_word_timestamps",
+            "whisper_compression_ratio_threshold",
+            "whisper_log_prob_threshold",
+            "whisper_no_speech_threshold",
+            "whisper_hallucination_silence_threshold",
             "whisper_language",
             "whisper_model_download_directory",
             "logging_level",
@@ -75,6 +96,7 @@ class Config(BaseModel):
             "subtitle_merge_threshold",
             "duplicate_detection_threshold",
             "remove_diacritics",
+            "collapse_repeated_phrases",
             "normalize_arabic_letters",
             "normalize_arabic_indic_digits",
             "retry_count",
@@ -122,7 +144,11 @@ class Config(BaseModel):
         return normalized
 
     @field_validator(
-        "whisper_language", "whisper_model_download_directory", mode="before"
+        "whisper_language",
+        "whisper_initial_prompt",
+        "whisper_model_download_directory",
+        "whisper_hallucination_silence_threshold",
+        mode="before",
     )
     @classmethod
     def empty_whisper_values_are_none(cls, value: Any) -> Any:
