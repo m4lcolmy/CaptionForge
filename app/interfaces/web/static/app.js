@@ -22,6 +22,7 @@
     inspect: el("inspect-btn"), hint: el("hint"),
     alert: el("alert"), alertTitle: el("alert-title"), alertBody: el("alert-body"),
     video: el("video"), thumb: el("thumb"), title: el("title"), byline: el("byline"),
+    media: el("media"), mediaList: el("media-list"), mediaNote: el("media-note"),
     tracks: el("tracks"), trackList: el("track-list"), selection: el("selection"),
     controls: el("controls"), language: el("language"), formats: el("formats"),
     run: el("run"), cancel: el("cancel"),
@@ -42,6 +43,7 @@
     inspection: null,
     chosenFormats: new Set(),
     jobId: null,
+    running: false,
     timer: null,
     preferences: {},
     saveTimer: null,
@@ -104,8 +106,14 @@
   }
 
   function busy(isBusy) {
+    state.running = isBusy;
     ui.inspect.disabled = isBusy;
     ui.run.disabled = isBusy;
+    // One click starts a download, so every other one has to stop working
+    // while a job runs: two writes to the output folder at once help nobody.
+    for (const chip of ui.mediaList.querySelectorAll("button")) {
+      chip.disabled = isBusy;
+    }
   }
 
   function formatDuration(seconds) {
@@ -345,6 +353,7 @@
       renderInspection(state.inspection);
     } catch (error) {
       ui.video.hidden = true;
+      ui.media.hidden = true;
       ui.tracks.hidden = true;
       showAlert("Could not read that video", error.message);
     } finally {
@@ -366,6 +375,7 @@
       ui.thumb.hidden = true;
     }
     ui.video.hidden = false;
+    renderMedia(result.media);
 
     // YouTube publishes ~155 machine translations of its own transcription.
     // Show the real tracks; keep the translations behind one line.
@@ -405,6 +415,77 @@
       : "No matching track, so the audio will be transcribed on this computer.";
     ui.tracks.hidden = false;
     ui.controls.hidden = false;
+  }
+
+  function renderMedia(media) {
+    // Audio first: it is the smallest file and the most common request, and
+    // it anchors a row that otherwise reads as an undifferentiated ladder.
+    const variants = media && Array.isArray(media.variants) ? media.variants : [];
+    const ordered = [
+      ...variants.filter((item) => item.kind === "audio"),
+      ...variants.filter((item) => item.kind !== "audio"),
+    ];
+    ui.mediaList.replaceChildren();
+    if (!ordered.length) {
+      // Nothing offered is not an error worth a paragraph; the row just goes.
+      ui.media.hidden = true;
+      return;
+    }
+    for (const variant of ordered) {
+      const item = document.createElement("li");
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chip";
+      chip.disabled = state.running;
+      const label = document.createElement("span");
+      label.textContent = variant.label;
+      chip.append(label);
+      if (variant.estimated_bytes) {
+        const size = document.createElement("span");
+        size.className = "kind";
+        size.textContent = `~${formatSize(variant.estimated_bytes)}`;
+        chip.append(size);
+      }
+      chip.addEventListener("click", () => startMedia(variant, chip));
+      item.append(chip);
+      ui.mediaList.append(item);
+    }
+    ui.media.hidden = false;
+  }
+
+  async function startMedia(variant, chip) {
+    if (state.running) return;
+    clearAlert();
+    ui.results.hidden = true;
+    busy(true);
+    chip.classList.add("picked");
+    setProgress(`Starting ${variant.label}`, 0);
+    ui.cancel.disabled = false;
+    ui.progress.hidden = false;
+    try {
+      const job = await api("/api/media", {
+        method: "POST",
+        body: JSON.stringify({
+          url: ui.url.value.trim(),
+          quality: variant.key,
+          overwrite: ui.overwrite.checked,
+        }),
+      });
+      state.jobId = job.id;
+      state.timer = setInterval(poll, POLL_INTERVAL_MS);
+      poll();
+    } catch (error) {
+      ui.progress.hidden = true;
+      busy(false);
+      chip.classList.remove("picked");
+      showAlert("Could not start the download", error.message);
+    }
+  }
+
+  function clearMediaChoice() {
+    for (const chip of ui.mediaList.querySelectorAll("button")) {
+      chip.classList.remove("picked");
+    }
   }
 
   function trackChip(track, selected) {
@@ -509,6 +590,7 @@
 
     stopPolling();
     busy(false);
+    clearMediaChoice();
     ui.progress.hidden = true;
     if (job.status === "failed") {
       showAlert("Job failed", job.error || "CaptionForge could not finish.");
@@ -522,9 +604,7 @@
   }
 
   function renderResults(job) {
-    ui.resultsLabel.textContent = job.used_existing_captions
-      ? "Exported the video's own captions"
-      : "Transcribed on this computer";
+    ui.resultsLabel.textContent = resultsHeading(job);
     ui.files.replaceChildren();
     for (const file of job.files) {
       const item = document.createElement("li");
@@ -544,6 +624,11 @@
       ui.files.append(item);
     }
     const notes = [`Saved to ${state.defaults.output_directory}`];
+    if (job.kind === "media") {
+      ui.resultsNote.textContent = notes[0];
+      ui.results.hidden = false;
+      return;
+    }
     if (job.transcription) {
       const info = job.transcription;
       const probability = info.language_probability !== null
@@ -555,6 +640,18 @@
     }
     ui.resultsNote.textContent = notes.join(" · ");
     ui.results.hidden = false;
+  }
+
+  function resultsHeading(job) {
+    if (job.kind === "media") {
+      const label = job.media ? job.media.label : "file";
+      return job.media && job.media.kind === "audio"
+        ? `Saved the audio as ${label}`
+        : `Saved the video at ${label}`;
+    }
+    return job.used_existing_captions
+      ? "Exported the video's own captions"
+      : "Transcribed on this computer";
   }
 
   start();

@@ -45,3 +45,15 @@ class JobRequestBody(BaseModel):
                 f"Unsupported format(s): {', '.join(unknown)}. Choose from {supported}."
             )
         return value
+
+
+class MediaJobRequestBody(BaseModel):
+    """A request to download the whole file as an MP4 or an MP3."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(min_length=1, max_length=2048)
+    # A key the page read back from an inspection: "audio", or a height such
+    # as "1080". The service resolves it against what the video really offers.
+    quality: str = Field(min_length=1, max_length=16)
+    overwrite: bool = False

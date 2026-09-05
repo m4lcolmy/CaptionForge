@@ -12,6 +12,7 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -40,7 +41,9 @@ from app.models.subtitle import (
 from app.models.video import VideoMetadata
 from app.services.audio_service import AudioService
 from app.services.export_service import ExportService
+from app.services.factory import create_media_service
 from app.services.subtitle_service import SubtitleService
+from app.services.transcription_plan import TranscriptionPlan
 from app.services.transcription_service import TranscriptionService
 from app.services.video_service import VideoService
 
@@ -221,6 +224,8 @@ def doctor() -> None:
         )
         table.add_row("Recommended device", recommended_device)
         table.add_row("Recommended compute type", recommended_compute)
+        table.add_row("GPU memory", _gpu_memory_status())
+        table.add_row("Planned configuration", _planned_configuration(config))
         table.add_row(
             "Writable temporary folder",
             f"{'Yes' if temp_writable else 'No'} ({config.temp_directory})",
@@ -536,6 +541,68 @@ def extract(
 
 
 @app.command()
+def download(
+    video_url: str = typer.Argument(
+        ..., metavar="VIDEO_URL", help="An individual YouTube video URL."
+    ),
+    quality: str = typer.Option(
+        "best",
+        "--quality",
+        "-q",
+        help="mp3 for audio only, best, or a height such as 1080.",
+    ),
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Directory to write the file into."),
+    ] = None,
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Replace an existing file instead of numbering it."
+    ),
+    show: bool = typer.Option(
+        False, "--list", help="Print what this video offers and download nothing."
+    ),
+) -> None:
+    """Download the whole video as MP4, or its audio alone as MP3."""
+
+    def run(config: Config) -> None:
+        service = create_media_service(config)
+        if show:
+            video, options = service.options(video_url)
+            table = Table(title=video.title, show_header=True)
+            table.add_column("Quality", style="cyan")
+            table.add_column("File")
+            table.add_column("Approximate size", justify="right")
+            for variant in options.variants:
+                table.add_row(
+                    variant.key,
+                    f"{variant.label} · {variant.extension}",
+                    _format_bytes(variant.estimated_bytes),
+                )
+            console.print(table)
+            return
+
+        def report(message: str, percent: float | None) -> None:
+            suffix = f" ({percent:.0f}%)" if percent is not None else ""
+            console.print(f"[cyan]{message}{suffix}[/cyan]")
+
+        result = service.download(
+            video_url,
+            quality,
+            output_directory=output,
+            overwrite=overwrite,
+            progress=report,
+        )
+        # Escape rather than disable markup: a video title can contain square
+        # brackets, and the label beside it should still be green.
+        console.print(
+            f"[bold green]Saved {result.variant.label}:[/bold green] "
+            f"{escape(str(result.path))}"
+        )
+
+    _run_with_config(run)
+
+
+@app.command()
 def clean(
     input_file: Annotated[
         Path,
@@ -735,6 +802,17 @@ def _format_duration(seconds: int | None) -> str:
     return f"{minutes:d}:{remaining_seconds:02d}"
 
 
+def _format_bytes(size: int | None) -> str:
+    """Render an estimated download size, or say plainly that it is unknown."""
+    if not size:
+        return "unknown"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.0f} KB"
+    if size < 1024 * 1024 * 1024:
+        return f"{size / (1024 * 1024):.0f} MB"
+    return f"{size / (1024 * 1024 * 1024):.1f} GB"
+
+
 def _exit_code_for(exc: CaptionForgeError) -> int:
     """Map application errors to stable process exit codes."""
     if isinstance(exc, (InvalidYouTubeUrlError, UnsupportedYouTubeUrlError)):
@@ -753,6 +831,45 @@ def _is_writable_directory(directory: Path) -> bool:
         return directory.is_dir() and os.access(directory, os.W_OK)
     except OSError:
         return False
+
+
+def _gpu_memory_status() -> str:
+    """Report what the driver has free, since that decides which plans fit."""
+    from app.adapters.gpu_memory import format_bytes, read_vram
+
+    snapshot = read_vram()
+    if snapshot is None:
+        return "Not available"
+    return (
+        f"{format_bytes(snapshot.free_bytes)} free of "
+        f"{format_bytes(snapshot.total_bytes)}"
+    )
+
+
+def _planned_configuration(config: Config) -> str:
+    """Show the plan a job would start on, after the pre-flight memory check."""
+    from app.adapters.gpu_memory import read_vram
+    from app.services.transcription_plan import build_ladder, select_plan
+
+    whisper = WhisperAdapter()
+    device = "cuda" if whisper.cuda_available() else "cpu"
+    requested = TranscriptionPlan(
+        model_name=config.default_whisper_model,
+        device=device,
+        compute_type=WhisperAdapter.select_compute_type(
+            config.whisper_compute_type, device
+        ),
+        beam_size=config.whisper_beam_size,
+        word_timestamps=config.whisper_word_timestamps,
+    )
+    if device != "cuda":
+        return requested.describe()
+    snapshot = read_vram()
+    ladder = build_ladder(requested)
+    planned = select_plan(ladder, getattr(snapshot, "free_bytes", None))
+    if planned == requested:
+        return planned.describe()
+    return f"{planned.describe()} - reduced from {requested.model_name} to fit"
 
 
 def _javascript_runtime_status() -> str:

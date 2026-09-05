@@ -17,14 +17,18 @@ from app.core.constants import APP_NAME, SUPPORTED_OUTPUT_FORMATS, VERSION
 from app.core.exceptions import CaptionForgeError
 from app.core.logging_config import get_logger
 from app.interfaces.web import errors
-from app.interfaces.web.jobs import JobRegistry, JobRequest
+from app.interfaces.web.jobs import JobRegistry, JobRequest, MediaJobRequest
 from app.interfaces.web.preferences import (
     WebPreferences,
     load_preferences,
     resolve,
     save_preferences,
 )
-from app.interfaces.web.schemas import InspectRequest, JobRequestBody
+from app.interfaces.web.schemas import (
+    InspectRequest,
+    JobRequestBody,
+    MediaJobRequestBody,
+)
 from app.interfaces.web.security import LocalOnlyMiddleware
 from app.services.factory import create_video_service
 
@@ -109,12 +113,17 @@ def create_app(
 
     @application.post("/api/inspect")
     async def inspect(body: InspectRequest) -> dict[str, object]:
-        """Return metadata and caption tracks for one video."""
+        """Return metadata, caption tracks, and downloadable qualities."""
         language = body.language or config.default_language
-        result = create_video_service(config).inspect(
+        result = create_video_service(config).inspect_all(
             body.url, language, allow_translated=body.allow_translated
         )
-        return result.model_dump(mode="json")
+        # One lookup answers both questions the page asks, so choosing a
+        # quality never costs a second wait on YouTube.
+        return {
+            **result.discovery.model_dump(mode="json"),
+            "media": result.media.model_dump(mode="json"),
+        }
 
     @application.post("/api/jobs", status_code=202)
     async def create_job(body: JobRequestBody) -> dict[str, object]:
@@ -134,6 +143,16 @@ def create_app(
                 timestamped_txt=body.timestamped_txt,
                 postprocess=body.postprocess,
                 allow_translated=body.allow_translated,
+            )
+        )
+        return record.snapshot()
+
+    @application.post("/api/media", status_code=202)
+    async def create_media_job(body: MediaJobRequestBody) -> dict[str, object]:
+        """Queue a whole-file download of the video or of its audio alone."""
+        record = registry.submit_media(
+            MediaJobRequest(
+                url=body.url, quality=body.quality, overwrite=body.overwrite
             )
         )
         return record.snapshot()

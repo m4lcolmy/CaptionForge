@@ -17,9 +17,14 @@ prefers the cheap one:
    converted to mono 16 kHz PCM WAV, and fed to `faster-whisper` on the local
    machine.
 
-The video stream is never downloaded in any path. There is no network call to
-any service other than YouTube (via `yt-dlp`) and the Whisper model host on
-first model download.
+It also does one thing that produces no text at all: **whole-file downloads**
+(`download`, or the page's download row) save the video as MP4 at a chosen
+quality, or its audio as MP3. This is the only path that fetches a video
+stream, it happens only when explicitly asked for, and it is kept in its own
+service so no caption or transcription path can reach it by accident.
+
+There is no network call to any service other than YouTube (via `yt-dlp`) and
+the Whisper model host on first model download.
 
 ---
 
@@ -33,11 +38,12 @@ app/
 │   ├── video_service.py         URL validation + live/availability guards + discovery
 │   ├── subtitle_service.py      track selection, caption parsing, minimal cleanup
 │   ├── audio_service.py         job workspace, audio download, FFmpeg conversion
+│   ├── media_service.py         whole-file MP4/MP3 downloads: naming, disk, cleanup
 │   ├── transcription_service.py caption-first workflow, Whisper fallback, export
 │   ├── postprocessing_service.py  timing + text normalization (shared by all sources)
 │   └── export_service.py        format validation, filename, atomic multi-format write
 ├── adapters/            everything that talks to the outside world
-│   ├── ytdlp_adapter.py    metadata, caption download, audio download, error translation
+│   ├── ytdlp_adapter.py    metadata, caption/audio/media download, format mapping, error translation
 │   ├── ffmpeg_adapter.py   subprocess (no shell), conversion, error translation
 │   └── whisper_adapter.py  lazy faster-whisper import, device/compute selection
 ├── models/              frozen Pydantic contracts (VideoMetadata, SubtitleTrack, …)
@@ -108,6 +114,7 @@ Validated constraints that matter in practice:
 | `extract` | metadata + caption track | yes | captions → parse → post-process → export |
 | `transcribe` | metadata + (caption **or** audio) | yes | caption-first, Whisper fallback |
 | `prepare-audio` | metadata + audio | WAV only | `AudioService.prepare` |
+| `download` | metadata + **video and/or audio stream** | yes | `MediaService.download` |
 | `clean` | none | yes | local file → parse → post-process → export |
 
 Every command runs through `_run_with_config`, which does the same four things:
@@ -288,7 +295,7 @@ already made) and `keep_temp=True` (the caller owns cleanup, in its `finally`).
   timestamps, which the adapter turns on for you when you set it.
 - `initial_prompt` (CLI `--prompt`) seeds the decoder with expected vocabulary.
 - **Word timestamps** are on by default. Each word's start, end and probability
-  is converted to a frozen `WordTiming` and carried on the segment; see §8 for
+  is converted to a frozen `WordTiming` and carried on the segment; see §9 for
   what post-processing does with them.
 - Cancellation is checked before loading and on every produced segment.
 - Engine objects never escape: segments are converted to frozen
@@ -307,7 +314,79 @@ written.
 
 ---
 
-## 8. Post-processing — the part that shapes the output
+## 8. `download` — the video or the audio as a file
+
+This is the only path that fetches a video stream, and it produces no text.
+`MediaService` ([app/services/media_service.py](../app/services/media_service.py))
+owns it end to end.
+
+```
+inspect (once) → resolve the requested quality → download into a job workspace
+→ move into the output folder under a safe name → clean the workspace
+```
+
+**What gets offered.** `map_media_options` in the yt-dlp adapter reads the
+`formats` list that the *same* metadata response already carries, so listing
+qualities costs no extra request. It keeps only the heights in
+`MEDIA_VIDEO_HEIGHTS` (2160 → 360) that the video actually publishes, plus one
+audio variant. Nothing is re-encoded into existence: a video that stops at 720p
+offers 720p and 360p, and that is all.
+
+**Size estimates.** Each variant carries an `estimated_bytes` so the page and
+`--list` can show a size before anything is downloaded. Among the streams at one
+height, the one with a *published* `filesize` wins over a higher `tbr` without
+one. YouTube advertises inflated bitrates on the adaptive entries that carry no
+size — trusting those overstated a 19 MB download as 30 MB. A separate video
+stream has its best audio stream's size added, because the person downloads
+both; a progressive stream already includes its sound. An MP3 is estimated from
+`MEDIA_AUDIO_BITRATE_KBPS` and the duration, since it is re-encoded and the
+source stream's size says nothing about the result. With no duration and no
+published size, the estimate is `None` and the interface simply shows no size,
+which is better than showing a wrong one.
+
+**Format selection** (`_format_selector`) asks for H.264 first:
+
+```
+bestvideo[height<=H][vcodec^=avc1]+bestaudio[ext=m4a]
+bestvideo[height<=H][ext=mp4]+bestaudio
+bestvideo[height<=H]+bestaudio
+best[height<=H] / best
+```
+
+YouTube also publishes VP9 inside an MP4 at most heights and yt-dlp rates it
+higher, but a `.mp4` that QuickTime and ordinary video editors refuse to open is
+not what an MP4 download promises. Audio uses `bestaudio/best` plus the
+`FFmpegExtractAudio` postprocessor.
+
+**Resolution is forgiving by design.** `MediaOptions.resolve` accepts `audio`,
+`mp3`, `best`, or a height, and a height the video does not publish steps *down*
+to the best one below it (and to the lowest available if it is below everything).
+A saved link, a typed `--quality 1080`, and a page left open while YouTube
+changed its ladder should all still do the obvious thing.
+
+**Cancellation.** yt-dlp exposes no cancel handle, so the progress hook is the
+only way out: it raises `MediaDownloadCancelledError` between chunks. The web
+worker translates that into a cancelled job exactly like a cancelled
+transcription.
+
+**Naming and safety** reuse the export rules — `sanitize_filename` +
+`available_stem`, so an existing file is numbered rather than replaced unless
+`--overwrite` is passed. Video files carry the quality (`title [720p].mp4`);
+audio does not, because there is only one audio quality. The extension follows
+what FFmpeg actually produced rather than what was requested, since a video with
+no MP4 pair comes back in the container yt-dlp had. Disk space is checked
+against the estimate times `SIZE_SAFETY_FACTOR` before starting, and the job
+workspace is removed on success and on failure alike — a cleanup failure is
+logged, never raised over a finished download.
+
+**In the web interface** this is a second job lane. `JobRegistry` runs media
+downloads on their own single-worker executor, so a one-click MP3 does not queue
+behind an hour of Whisper, while sharing the same job records, polling endpoint,
+cancel endpoint, and file-download endpoint.
+
+---
+
+## 9. Post-processing — the part that shapes the output
 
 `PostProcessingService._process`
 ([app/services/postprocessing_service.py](../app/services/postprocessing_service.py))
@@ -383,7 +462,7 @@ command is post-processing applied to a file you already have.
 
 ---
 
-## 9. Export and file safety
+## 10. Export and file safety
 
 `ExportService.export` ([app/services/export_service.py](../app/services/export_service.py)):
 
@@ -423,7 +502,7 @@ Renderers ([app/exporters/](../app/exporters/)):
 
 ---
 
-## 10. Errors, retries, logging
+## 11. Errors, retries, logging
 
 **Hierarchy.** Everything expected derives from `CaptionForgeError`, which
 carries a user-facing `message` and a technical `details`. The base class
@@ -460,7 +539,7 @@ requested, and the process exits 130.
 
 ---
 
-## 11. The `Job` model
+## 12. The `Job` model
 
 `Job` ([app/models/job.py](../app/models/job.py)) is the in-process record for
 one run: UUID, source URL, language, formats, status, timestamps, workspace and
@@ -472,7 +551,7 @@ across runs — it exists to give logs a consistent, correlatable shape.
 
 ---
 
-## 12. Development
+## 13. Development
 
 ```bash
 .venv/bin/python -m pytest
@@ -493,31 +572,35 @@ Offline testing is possible because every external boundary is injectable:
 
 ---
 
-## 13. Extending it
+## 14. Extending it
 
 | Goal | Touch |
 |---|---|
 | New output format | add a render function in `app/exporters/`, register it in `ExportService.export`, add it to `SUPPORTED_OUTPUT_FORMATS` |
 | Different transcription engine | new adapter returning `TranscriptionResult`; `TranscriptionService` needs no change |
-| Another video source | new adapter with the same `inspect`/`download_subtitle`/`download_audio` shape |
+| Another video source | new adapter with the same `inspect`/`download_subtitle`/`download_audio`/`download_media` shape |
+| Another download quality | extend `MEDIA_VIDEO_HEIGHTS`; mapping, UI chips, CLI and `resolve` all follow from it |
 | Different subtitle style rules | `PostProcessingService` + the related `Config` fields |
 | New language display name | `_LANGUAGE_NAMES` in `app/utils/language_utils.py` |
 
 ---
 
-## 14. Known limitations and rough edges
+## 15. Known limitations and rough edges
 
 Deliberate limits: individual non-live videos only; no playlists, channels,
 live streams, translation, diarization, cookie/authenticated access, or GUI; no
-aggressive spelling or grammar rewriting.
+aggressive spelling or grammar rewriting. Downloads offer only the heights a
+video publishes, and never re-encode to reach a height it does not.
 
 Rough edges in the current code, worth knowing:
 
 - `prepare-audio` still prints "Transcription will be implemented in Phase 5".
   It is stale — `transcribe` implements it today.
 - yt-dlp writes its own `[download]` progress and `ERROR:` lines straight to the
-  terminal during caption download, despite `quiet: True`. This contradicts the
-  "raw yt-dlp text never reaches stdout" guarantee; `noprogress` is not set.
+  terminal during caption and audio download, despite `quiet: True`. This
+  contradicts the "raw yt-dlp text never reaches stdout" guarantee; those paths
+  do not set `noprogress`. `download_media` does set it, so whole-file
+  downloads report only CaptionForge's own progress.
 - `FFmpegAdapter.build_conversion_command` has a `codec = "pcm_s16le" if … else
   "pcm_s16le"` branch; `audio_format` only affects the file extension.
 - `configure_logging`'s docstring mentions console and file handlers, but only

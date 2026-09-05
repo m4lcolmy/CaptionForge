@@ -11,6 +11,8 @@ from app.core.exceptions import (
     InsufficientDiskSpaceError,
     InvalidYouTubeUrlError,
     LiveStreamNotSupportedError,
+    MediaDownloadError,
+    MediaFormatUnavailableError,
     MetadataRetrievalError,
     SubtitleDownloadError,
     UnsupportedModelError,
@@ -29,6 +31,8 @@ _STATUS_BY_ERROR: tuple[tuple[type[CaptionForgeError], int], ...] = (
     (UnsupportedYouTubeUrlError, HTTPStatus.BAD_REQUEST),
     (LiveStreamNotSupportedError, HTTPStatus.BAD_REQUEST),
     (UnsupportedModelError, HTTPStatus.BAD_REQUEST),
+    # More specific than MediaDownloadError below it, so it has to come first.
+    (MediaFormatUnavailableError, HTTPStatus.BAD_REQUEST),
     (ValidationError, HTTPStatus.BAD_REQUEST),
     (ConfigurationError, HTTPStatus.BAD_REQUEST),
     (VideoUnavailableError, HTTPStatus.NOT_FOUND),
@@ -39,6 +43,7 @@ _STATUS_BY_ERROR: tuple[tuple[type[CaptionForgeError], int], ...] = (
     (MetadataRetrievalError, HTTPStatus.BAD_GATEWAY),
     (SubtitleDownloadError, HTTPStatus.BAD_GATEWAY),
     (AudioDownloadError, HTTPStatus.BAD_GATEWAY),
+    (MediaDownloadError, HTTPStatus.BAD_GATEWAY),
 )
 
 

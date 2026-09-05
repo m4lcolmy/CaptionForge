@@ -130,6 +130,30 @@ class ProcessingInterruptedError(AudioError):
     """Raised when audio preparation is interrupted."""
 
 
+class MediaError(CaptionForgeError):
+    """Base class for whole-file video and audio download failures."""
+
+
+class MediaDownloadError(MediaError):
+    """Raised when a requested MP4 or MP3 download fails."""
+
+    @property
+    def retryable(self) -> bool:
+        return True
+
+
+class MediaFormatUnavailableError(MediaDownloadError):
+    """Raised when a video publishes no stream matching the request."""
+
+    @property
+    def retryable(self) -> bool:
+        return False
+
+
+class MediaDownloadCancelledError(MediaError):
+    """Raised when the user stops a download before it finishes."""
+
+
 class TranscriptionError(CaptionForgeError):
     """Base class for local transcription failures."""
 

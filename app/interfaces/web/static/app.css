@@ -231,6 +231,14 @@ button[disabled] { cursor: not-allowed; opacity: 0.45; }
 
 button.chip:hover:not(.picked) { border-color: var(--emerald); color: var(--emerald); }
 
+/* ---- download row ---- */
+
+.media { display: flex; flex-direction: column; gap: 0.5rem; }
+
+/* Every chip dims while a job runs, except the one that is running: the row
+   itself says which quality is being fetched, so nothing else has to. */
+button.chip.picked[disabled] { opacity: 1; cursor: progress; }
+
 /* ---- controls ---- */
 
 .controls {

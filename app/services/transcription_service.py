@@ -23,6 +23,7 @@ from app.models.video import VideoMetadata
 from app.services.audio_service import AudioService
 from app.services.export_service import ExportService
 from app.services.postprocessing_service import PostProcessingService
+from app.services.resilient_transcription import ResilientTranscriber
 from app.services.subtitle_service import SubtitleService
 from app.services.video_service import VideoService
 from app.utils.file_utils import cleanup_path
@@ -60,6 +61,9 @@ class TranscriptionService:
         self._subtitle_service = subtitle_service
         self._audio_service = audio_service
         self._whisper = whisper
+        # Owns pre-flight memory planning, the degradation ladder, and resume;
+        # the raw adapter still runs exactly one configuration per call.
+        self._resilient = ResilientTranscriber(whisper)
         self._export_service = export_service
         self._config = config
 
@@ -166,14 +170,17 @@ class TranscriptionService:
                 selected_model,
                 selected_device,
             )
+            # retry_call still covers transient model-download failures; memory
+            # exhaustion is not retryable and is handled by stepping down a plan.
             transcription = retry_call(
-                lambda: self._whisper.transcribe(
+                lambda: self._resilient.transcribe(
                     audio_path,
                     model_name=selected_model,
                     device=selected_device,
                     compute_type=compute_type or self._config.whisper_compute_type,
-                    language=selected_language,
                     beam_size=self._config.whisper_beam_size,
+                    word_timestamps=self._config.whisper_word_timestamps,
+                    language=selected_language,
                     vad_enabled=self._config.whisper_vad_enabled,
                     min_silence_duration_ms=(
                         self._config.whisper_min_silence_duration_ms
@@ -185,7 +192,6 @@ class TranscriptionService:
                     ),
                     initial_prompt=initial_prompt
                     or self._config.whisper_initial_prompt,
-                    word_timestamps=self._config.whisper_word_timestamps,
                     compression_ratio_threshold=(
                         self._config.whisper_compression_ratio_threshold
                     ),

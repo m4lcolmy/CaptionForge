@@ -29,6 +29,9 @@ from app.models.transcription import (
 
 ProgressCallback = Callable[[str, float | None], None]
 CancelCallback = Callable[[], bool]
+# Invoked for each accepted segment as it streams out of the engine, so a
+# caller can checkpoint finished work before a later failure discards it.
+SegmentCallback = Callable[[TranscriptionSegment], None]
 
 # The families CTranslate2 dlopens by bare soname, in dependency order:
 # libcublas needs libcublasLt, so that one has to be resident first.
@@ -151,10 +154,20 @@ class WhisperAdapter:
         no_speech_threshold: float = 0.6,
         hallucination_silence_threshold: float | None = None,
         download_root: Path | None = None,
+        time_offset_seconds: float = 0.0,
+        first_segment_index: int = 1,
+        total_duration_seconds: float | None = None,
         progress: ProgressCallback | None = None,
         cancelled: CancelCallback | None = None,
+        on_segment: SegmentCallback | None = None,
     ) -> TranscriptionResult:
-        """Transcribe an audio file and convert all output to local models."""
+        """Transcribe an audio file and convert all output to local models.
+
+        ``time_offset_seconds`` and ``first_segment_index`` place the result
+        inside a longer recording, so a tail sliced off a partially
+        transcribed file continues the original numbering and timeline
+        rather than restarting at zero.
+        """
         notify = progress or (lambda _message, _percent: None)
         is_cancelled = cancelled or (lambda: False)
         selected_device = self.select_device(device)
@@ -184,13 +197,15 @@ class WhisperAdapter:
                 language=language,
                 beam_size=beam_size,
                 vad_filter=vad_enabled,
-                vad_parameters={
-                    "min_silence_duration_ms": min_silence_duration_ms,
-                    "threshold": vad_threshold,
-                    "speech_pad_ms": vad_speech_pad_ms,
-                }
-                if vad_enabled
-                else None,
+                vad_parameters=(
+                    {
+                        "min_silence_duration_ms": min_silence_duration_ms,
+                        "threshold": vad_threshold,
+                        "speech_pad_ms": vad_speech_pad_ms,
+                    }
+                    if vad_enabled
+                    else None
+                ),
                 condition_on_previous_text=condition_on_previous_text,
                 initial_prompt=initial_prompt,
                 word_timestamps=aligned_words,
@@ -205,6 +220,11 @@ class WhisperAdapter:
                 getattr(info, "duration", None)
                 or getattr(info, "duration_after_vad", None)
             )
+            # A resumed run only sees its own slice, so progress is measured
+            # against the whole recording when the caller knows that length.
+            span = total_duration_seconds or (
+                duration + time_offset_seconds if duration else None
+            )
             converted: list[TranscriptionSegment] = []
             for fallback_index, segment in enumerate(raw_segments, start=1):
                 if is_cancelled():
@@ -212,24 +232,27 @@ class WhisperAdapter:
                 text = str(getattr(segment, "text", "")).strip()
                 if not text:
                     continue
-                start = float(segment.start)
-                end = float(segment.end)
-                converted.append(
-                    TranscriptionSegment(
-                        index=len(converted) + 1,
-                        start_seconds=max(0.0, start),
-                        end_seconds=max(end, start + 0.001),
-                        text=text,
-                        language=detected_language,
-                        confidence=_confidence(segment),
-                        no_speech_probability=_optional_float(
-                            getattr(segment, "no_speech_prob", None)
-                        ),
-                        words=_word_timings(segment),
-                    )
+                start = float(segment.start) + time_offset_seconds
+                end = float(segment.end) + time_offset_seconds
+                accepted = TranscriptionSegment(
+                    index=first_segment_index + len(converted),
+                    start_seconds=max(0.0, start),
+                    end_seconds=max(end, start + 0.001),
+                    text=text,
+                    language=detected_language,
+                    confidence=_confidence(segment),
+                    no_speech_probability=_optional_float(
+                        getattr(segment, "no_speech_prob", None)
+                    ),
+                    words=_word_timings(segment, time_offset_seconds),
                 )
-                if duration and duration > 0:
-                    percent = 40.0 + min(45.0, max(0.0, end / duration * 45.0))
+                converted.append(accepted)
+                # Publish before the next decode step can fail, so whatever
+                # reaches here survives an out-of-memory abort further on.
+                if on_segment is not None:
+                    on_segment(accepted)
+                if span and span > 0:
+                    percent = 40.0 + min(45.0, max(0.0, end / span * 45.0))
                 else:
                     percent = min(84.0, 40.0 + fallback_index)
                 notify("Transcribing", percent)
@@ -241,7 +264,7 @@ class WhisperAdapter:
                 segments=tuple(converted),
                 detected_language=detected_language,
                 language_probability=probability,
-                duration_seconds=duration,
+                duration_seconds=span if span else duration,
                 model_name=model_name,
                 device=selected_device,
                 compute_type=selected_compute,
@@ -319,7 +342,7 @@ class WhisperAdapter:
         ) from exc
 
 
-def _word_timings(segment: Any) -> tuple[WordTiming, ...]:
+def _word_timings(segment: Any, offset_seconds: float = 0.0) -> tuple[WordTiming, ...]:
     """Convert engine word alignments, skipping anything malformed."""
     words = getattr(segment, "words", None) or ()
     converted: list[WordTiming] = []
@@ -328,8 +351,8 @@ def _word_timings(segment: Any) -> tuple[WordTiming, ...]:
         if not text:
             continue
         try:
-            start = max(0.0, float(word.start))
-            end = max(start, float(word.end))
+            start = max(0.0, float(word.start) + offset_seconds)
+            end = max(start, float(word.end) + offset_seconds)
         except (TypeError, ValueError):
             continue
         converted.append(

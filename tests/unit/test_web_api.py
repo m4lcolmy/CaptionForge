@@ -1,6 +1,7 @@
 """Offline tests for the local web interface."""
 
 import re
+import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -10,11 +11,21 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import Config
-from app.core.exceptions import InvalidYouTubeUrlError, WhisperNotInstalledError
+from app.core.constants import MEDIA_AUDIO_KEY, MEDIA_VIDEO_HEIGHTS
+from app.core.exceptions import (
+    InvalidYouTubeUrlError,
+    MediaDownloadCancelledError,
+    MediaFormatUnavailableError,
+    TranscriptionCancelledError,
+    WhisperNotInstalledError,
+)
 from app.interfaces.web import server as web_server
 from app.interfaces.web.jobs import JobRequest
+from app.interfaces.web.schemas import MediaJobRequestBody
+from app.models.media import MediaDownloadResult, MediaKind, MediaOptions, MediaVariant
 from app.models.subtitle import SubtitleDiscoveryResult
 from app.models.video import VideoMetadata
+from app.services.video_service import VideoInspection
 from tests.conftest import VIDEO_URL, make_track
 
 TOKEN = "test-token-value"
@@ -47,6 +58,27 @@ def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[TestClie
         yield test_client
 
 
+MEDIA = MediaOptions(
+    variants=(
+        MediaVariant(
+            key="720",
+            kind=MediaKind.VIDEO,
+            label="720p",
+            extension="mp4",
+            height=720,
+            estimated_bytes=50_000_000,
+        ),
+        MediaVariant(
+            key="audio",
+            kind=MediaKind.AUDIO,
+            label="MP3",
+            extension="mp3",
+            estimated_bytes=5_000_000,
+        ),
+    )
+)
+
+
 def stub_inspection(
     monkeypatch: pytest.MonkeyPatch, video: VideoMetadata
 ) -> SubtitleDiscoveryResult:
@@ -64,10 +96,28 @@ def stub_inspection(
         def inspect(self, url: str, language: str, **_: Any) -> SubtitleDiscoveryResult:
             return result
 
+        def inspect_all(self, url: str, language: str, **_: Any) -> VideoInspection:
+            return VideoInspection(discovery=result, media=MEDIA)
+
     monkeypatch.setattr(
         web_server, "create_video_service", lambda config: StubVideoService()
     )
     return result
+
+
+def stub_media_service(
+    monkeypatch: pytest.MonkeyPatch, download: Callable[..., Any]
+) -> None:
+    """Replace the download service graph used by the media worker."""
+    from app.interfaces.web import jobs as jobs_module
+
+    class StubService:
+        def download(self, url: str, quality: str, **kwargs: Any) -> Any:
+            return download(url, quality, **kwargs)
+
+    monkeypatch.setattr(
+        jobs_module, "create_media_service", lambda config: StubService()
+    )
 
 
 def stub_workflow(monkeypatch: pytest.MonkeyPatch, process: Callable[..., Any]) -> None:
@@ -159,7 +209,7 @@ def test_inspect_maps_invalid_url_to_bad_request(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class FailingService:
-        def inspect(self, *args: Any, **kwargs: Any) -> Any:
+        def inspect_all(self, *args: Any, **kwargs: Any) -> Any:
             raise InvalidYouTubeUrlError("That is not a YouTube video link.")
 
     monkeypatch.setattr(
@@ -416,3 +466,132 @@ def test_script_never_starts_with_an_empty_selection() -> None:
     assert "function initialFormats()" in script
     assert "new Set(initialFormats())" in script
     assert '["srt"]' in script
+
+
+def test_inspect_carries_the_download_qualities(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, video_metadata: VideoMetadata
+) -> None:
+    """One lookup answers both questions the page asks."""
+    stub_inspection(monkeypatch, video_metadata)
+    response = client.post("/api/inspect", json={"url": VIDEO_URL}, headers=HEADERS)
+    assert response.status_code == 200
+    variants = response.json()["media"]["variants"]
+    assert [item["key"] for item in variants] == ["720", "audio"]
+    assert variants[1]["label"] == "MP3"
+
+
+def test_media_job_downloads_and_serves_the_file(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    video_metadata: VideoMetadata,
+) -> None:
+    produced = tmp_path / "Example video [720p].mp4"
+    produced.write_bytes(b"not really an mp4")
+    variant = MEDIA.variants[0]
+    stub_media_service(
+        monkeypatch,
+        lambda url, quality, **kwargs: MediaDownloadResult(
+            path=produced, variant=variant, video=video_metadata
+        ),
+    )
+    created = client.post(
+        "/api/media", json={"url": VIDEO_URL, "quality": "720"}, headers=HEADERS
+    )
+    assert created.status_code == 202
+    assert created.json()["kind"] == "media"
+
+    finished = wait_for_terminal(client, created.json()["id"])
+    assert finished["status"] == "completed"
+    assert finished["media"]["label"] == "720p"
+    assert [file["name"] for file in finished["files"]] == ["Example video [720p].mp4"]
+
+    download = client.get(
+        f"/api/jobs/{created.json()['id']}/files/Example video [720p].mp4",
+        headers=HEADERS,
+    )
+    assert download.status_code == 200
+    assert download.content == b"not really an mp4"
+
+
+def test_media_job_reports_the_short_message_only(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def download(url: str, quality: str, **kwargs: Any) -> Any:
+        raise MediaFormatUnavailableError(
+            "This video does not publish a 4320p stream.",
+            details="yt_dlp.utils.DownloadError: requested format is not available",
+        )
+
+    stub_media_service(monkeypatch, download)
+    created = client.post(
+        "/api/media", json={"url": VIDEO_URL, "quality": "4320"}, headers=HEADERS
+    )
+    finished = wait_for_terminal(client, created.json()["id"])
+    assert finished["status"] == "failed"
+    assert finished["error"] == "This video does not publish a 4320p stream."
+    assert "DownloadError" not in str(finished)
+
+
+def test_media_job_can_be_cancelled(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def download(url: str, quality: str, **kwargs: Any) -> Any:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if kwargs["cancelled"]():
+                raise MediaDownloadCancelledError("The download was cancelled.")
+            time.sleep(0.01)
+        raise AssertionError("cancellation was never observed")
+
+    stub_media_service(monkeypatch, download)
+    created = client.post(
+        "/api/media", json={"url": VIDEO_URL, "quality": "audio"}, headers=HEADERS
+    )
+    job_id = created.json()["id"]
+    client.post(f"/api/jobs/{job_id}/cancel", headers=HEADERS)
+    assert wait_for_terminal(client, job_id)["status"] == "cancelled"
+
+
+def test_a_download_does_not_queue_behind_a_transcription(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, video_metadata: VideoMetadata
+) -> None:
+    """The two lanes are separate, so one click stays responsive."""
+    running = threading.Event()
+
+    def process(url: str, **kwargs: Any) -> Any:
+        running.set()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not kwargs["cancelled"]():
+            time.sleep(0.01)
+        raise TranscriptionCancelledError("Transcription was cancelled.")
+
+    produced = Path(str(client.app.state.config.default_output_folder))
+    produced.mkdir(parents=True, exist_ok=True)
+    file = produced / "Example video.mp3"
+    file.write_bytes(b"audio")
+    stub_workflow(monkeypatch, process)
+    stub_media_service(
+        monkeypatch,
+        lambda url, quality, **kwargs: MediaDownloadResult(
+            path=file, variant=MEDIA.variants[1], video=video_metadata
+        ),
+    )
+    captions = client.post("/api/jobs", json={"url": VIDEO_URL}, headers=HEADERS)
+    assert running.wait(timeout=5.0)
+
+    media = client.post(
+        "/api/media", json={"url": VIDEO_URL, "quality": "audio"}, headers=HEADERS
+    )
+    finished = wait_for_terminal(client, media.json()["id"])
+    assert finished["status"] == "completed"
+    client.post(f"/api/jobs/{captions.json()['id']}/cancel", headers=HEADERS)
+
+
+def test_the_page_offers_no_quality_the_api_cannot_resolve() -> None:
+    """Every key the script can send is a key the request model accepts."""
+    script = (web_server.STATIC_DIRECTORY / "app.js").read_text(encoding="utf-8")
+    assert "quality: variant.key" in script
+    for height in MEDIA_VIDEO_HEIGHTS:
+        MediaJobRequestBody(url=VIDEO_URL, quality=str(height))
+    MediaJobRequestBody(url=VIDEO_URL, quality=MEDIA_AUDIO_KEY)

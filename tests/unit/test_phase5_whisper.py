@@ -196,6 +196,13 @@ class WorkflowAudio:
 class WorkflowWhisper:
     calls = 0
 
+    def select_device(self, requested: str) -> str:
+        return "cpu" if requested == "auto" else requested
+
+    @staticmethod
+    def select_compute_type(requested: str, device: str) -> str:
+        return WhisperAdapter.select_compute_type(requested, device)
+
     def transcribe(self, _audio: Path, **_kwargs: Any) -> TranscriptionResult:
         self.calls += 1
         return TranscriptionResult(

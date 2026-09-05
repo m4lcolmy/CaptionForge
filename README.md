@@ -2,13 +2,20 @@
 
 CaptionForge downloads and exports existing YouTube captions. When no matching
 caption exists, it prepares mono 16 kHz audio and transcribes it locally with
-`faster-whisper`. It never downloads the full video.
+`faster-whisper`. It can also save the video itself as an MP4 at a chosen
+quality, or its audio alone as an MP3.
+
+The caption and transcription workflows still never fetch the video stream:
+whole-file downloads happen only when you ask for one, through `download` or
+the page's download row.
 
 ## Features
 
 - Run the whole workflow from a browser on your own machine
 - Inspect video metadata and available caption tracks
 - Select captions by preferred language
+- Save the video as MP4 at any quality it publishes, or the audio as MP3
+- See each quality's approximate size before starting the download
 - Export SRT, VTT, TXT, JSON, or DOCX
 - Generate multiple formats in one command
 - Create plain or timestamped TXT transcripts
@@ -52,6 +59,12 @@ CaptionForge prints a `http://127.0.0.1:PORT/?t=TOKEN` link and opens it. Paste 
 video link, pick a language and formats, and download the results. Nothing is
 uploaded anywhere: yt-dlp, FFmpeg, and faster-whisper all run locally, exactly as
 they do for the commands below.
+
+Looking a video up also fills in a **Download the file** row: one chip per
+quality that video actually publishes, each showing its approximate size, with
+MP3 first. One click starts that download; the same progress bar, Cancel button,
+and results list serve it. A download and a transcription run on separate
+workers, so asking for an MP3 never waits behind an hour of Whisper.
 
 ```bash
 captionforge web --port 8800    # bind a fixed port instead of a free one
@@ -142,6 +155,28 @@ Transcription quality options:
   less cross-window context. Set it to `true` to restore the engine default.
 - `whisper_compression_ratio_threshold`, `whisper_log_prob_threshold` and
   `whisper_no_speech_threshold` are the engine's degeneracy guards, now tunable.
+
+Save the video itself, or just its sound:
+
+```bash
+captionforge download "https://youtu.be/VIDEO_ID" --list          # what it offers
+captionforge download "https://youtu.be/VIDEO_ID"                 # best MP4
+captionforge download "https://youtu.be/VIDEO_ID" --quality 720   # 720p MP4
+captionforge download "https://youtu.be/VIDEO_ID" --quality mp3   # MP3 audio
+```
+
+`--quality` takes `mp3`, `best`, or a height. A height that a video does not
+publish steps down to the best one below it rather than failing, so `--quality
+1080` still works on a video that stops at 720p. MP4 downloads prefer H.264
+video and AAC audio: YouTube also offers VP9 inside an MP4 and yt-dlp rates it
+higher, but a `.mp4` that QuickTime and ordinary video editors refuse to open is
+not what an MP4 download should hand back.
+
+Files are named after the video, with the quality in brackets for video
+(`title [720p].mp4`) and without one for audio (`title.mp3`), since there is
+only one audio quality. As everywhere else, an existing file is numbered rather
+than replaced unless `--overwrite` is passed. Sizes shown before a download are
+estimates read from the stream metadata, usually within a few percent.
 
 `captionforge prepare-audio` remains available for audio-only diagnostics.
 Run `captionforge doctor` to check FFmpeg, yt-dlp, faster-whisper, python-docx,
@@ -329,9 +364,9 @@ Run optional integrations explicitly:
 
 ## Limitations
 
-- No full-video downloading
 - No live streams, playlists, or translation
-- The web interface covers `extract` and `transcribe` only; settings, `clean`, `doctor`, and local file input stay on the command line
+- MP4 downloads offer 360p to 2160p, and only the heights a video publishes; other heights are not re-encoded into existence
+- The web interface covers `extract`, `transcribe`, and `download` only; settings, `clean`, `doctor`, and local file input stay on the command line
 - No authenticated or cookie-based access
 - No speaker diarization, translation, or aggressive spelling/grammar rewriting
 
