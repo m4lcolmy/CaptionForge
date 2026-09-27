@@ -275,6 +275,11 @@ button.chip.picked[disabled] { opacity: 1; cursor: progress; }
 }
 .opt input { accent-color: var(--emerald); width: 15px; height: 15px; }
 
+/* ---- updates row ---- */
+
+.updates { display: flex; flex-direction: column; gap: 0.5rem; }
+.updates-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+
 /* ---- radio groups ---- */
 
 .radios { border: none; margin: 0; padding: 0; min-width: 0; }

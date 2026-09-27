@@ -23,6 +23,9 @@ dependencies = [
 [project.scripts]
 captionforge = "app.main:main"
 
+[project.gui-scripts]
+captionforge-desktop = "app.interfaces.desktop:main"
+
 [project.optional-dependencies]
 transcription = [
     "faster-whisper>=1.1,<2.0",
@@ -30,6 +33,11 @@ transcription = [
 web = [
     "fastapi>=0.115,<1.0",
     "uvicorn>=0.30,<1.0",
+]
+desktop = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn>=0.30,<1.0",
+    "pywebview>=5.0,<7.0",
 ]
 dev = [
     "black>=24.4",
@@ -45,6 +53,7 @@ include = ["app*"]
 
 [tool.setuptools.package-data]
 "app.interfaces.web" = ["static/*"]
+"app.interfaces" = ["assets/*"]
 
 [tool.black]
 line-length = 88
@@ -71,5 +80,5 @@ check_untyped_defs = true
 warn_unused_ignores = true
 
 [[tool.mypy.overrides]]
-module = ["yt_dlp", "yt_dlp.*"]
+module = ["yt_dlp", "yt_dlp.*", "webview", "webview.*"]
 ignore_missing_imports = true

@@ -1,5 +1,7 @@
 """yt-dlp adapter for metadata-only YouTube inspection."""
 
+import importlib
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from datetime import date, datetime
@@ -7,7 +9,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Protocol
 
-import yt_dlp
 from yt_dlp.utils import DownloadError
 
 from app.core.constants import (
@@ -25,6 +26,8 @@ from app.core.exceptions import (
     MediaDownloadCancelledError,
     MediaDownloadError,
     MediaFormatUnavailableError,
+    MediaStreamForbiddenError,
+    MetadataRefusedError,
     MetadataRetrievalError,
     PrivateVideoError,
     SubtitleDownloadError,
@@ -37,6 +40,10 @@ from app.models.subtitle import RawSubtitle, SubtitleSourceType, SubtitleTrack
 from app.models.video import VideoMetadata
 from app.utils.language_utils import language_name, normalize_language_code
 from app.utils.url_utils import canonical_youtube_url
+
+# What a refusal usually means. What to do about it is the interface's to say:
+# the terminal offers the update, and so does the page.
+OUTDATED = "This normally means the installed yt-dlp is too old for YouTube's site."
 
 
 class Extractor(Protocol):
@@ -86,10 +93,18 @@ class YtDlpAdapter:
         extractor_factory: ExtractorFactory | None = None,
         ffmpeg_location: str | None = None,
     ) -> None:
-        self._extractor_factory = extractor_factory or yt_dlp.YoutubeDL
+        # None means the real yt-dlp, looked up on every call: an update the
+        # person approves can load a newer release while this adapter is alive.
+        self._extractor_factory = extractor_factory
         # Merging an MP4 and encoding an MP3 both shell out to FFmpeg, so a
         # configured executable has to reach yt-dlp as well as our own adapter.
         self._ffmpeg_location = ffmpeg_location
+
+    def _extractor(self, options: dict[str, Any]) -> AbstractContextManager[Extractor]:
+        if self._extractor_factory is not None:
+            return self._extractor_factory(options)
+        yt_dlp = importlib.import_module("yt_dlp")
+        return yt_dlp.YoutubeDL(options)
 
     def inspect(self, video_id: str, original_url: str) -> YtDlpInspection:
         """Retrieve and map metadata and caption availability for one video."""
@@ -97,9 +112,9 @@ class YtDlpAdapter:
         log = get_logger()
         log.info("Starting YouTube metadata retrieval for video_id={}", video_id)
         try:
-            with self._extractor_factory(dict(self.OPTIONS)) as extractor:
+            with self._extractor(dict(self.OPTIONS)) as extractor:
                 raw = extractor.extract_info(url, download=False)
-        except DownloadError as exc:
+        except _download_errors() as exc:
             log.exception("yt-dlp metadata retrieval failed for video_id={}", video_id)
             raise self._translate_download_error(exc) from exc
         except (OSError, ValueError, TypeError, KeyError) as exc:
@@ -159,14 +174,12 @@ class YtDlpAdapter:
                 "subtitlesformat": "json3/vtt/best",
             }
             try:
-                with self._extractor_factory(options) as extractor:
+                with self._extractor(options) as extractor:
                     extractor.extract_info(url, download=True)
-            except DownloadError as exc:
+            except _download_errors() as exc:
                 if _is_extractor_stale(str(exc).lower()):
                     raise SubtitleStreamForbiddenError(
-                        "YouTube refused the caption track. This normally means "
-                        "the installed yt-dlp is too old for YouTube's current "
-                        "site: upgrade it with 'pip install --upgrade yt-dlp'.",
+                        f"YouTube refused the caption track. {OUTDATED}",
                         details=str(exc),
                     ) from exc
                 raise SubtitleDownloadError(
@@ -232,11 +245,11 @@ class YtDlpAdapter:
             "noplaylist": True,
         }
         try:
-            with self._extractor_factory(options) as extractor:
+            with self._extractor(options) as extractor:
                 info = extractor.extract_info(
                     canonical_youtube_url(video_id), download=True
                 )
-        except DownloadError as exc:
+        except _download_errors() as exc:
             message = str(exc).lower()
             if "requested format is not available" in message:
                 raise AudioFormatUnavailableError(
@@ -244,10 +257,7 @@ class YtDlpAdapter:
                 ) from exc
             if _is_extractor_stale(message):
                 raise AudioStreamForbiddenError(
-                    "YouTube refused the audio stream. This normally means the "
-                    "installed yt-dlp is too old for YouTube's current site: "
-                    "upgrade it with 'pip install --upgrade yt-dlp' and retry.",
-                    details=str(exc),
+                    f"YouTube refused the audio stream. {OUTDATED}", details=str(exc)
                 ) from exc
             raise AudioDownloadError(
                 "The audio could not be downloaded. Please try again later.",
@@ -339,11 +349,11 @@ class YtDlpAdapter:
         if self._ffmpeg_location:
             options["ffmpeg_location"] = self._ffmpeg_location
         try:
-            with self._extractor_factory(options) as extractor:
+            with self._extractor(options) as extractor:
                 extractor.extract_info(canonical_youtube_url(video_id), download=True)
         except MediaDownloadCancelledError:
             raise
-        except DownloadError as exc:
+        except _download_errors() as exc:
             message = str(exc).lower()
             if stop():
                 raise MediaDownloadCancelledError(
@@ -355,11 +365,8 @@ class YtDlpAdapter:
                     "Look the video up again to refresh what it offers."
                 ) from exc
             if _is_extractor_stale(message):
-                raise MediaFormatUnavailableError(
-                    "YouTube refused the media stream. This normally means the "
-                    "installed yt-dlp is too old for YouTube's current site: "
-                    "upgrade it with 'pip install --upgrade yt-dlp' and retry.",
-                    details=str(exc),
+                raise MediaStreamForbiddenError(
+                    f"YouTube refused the media stream. {OUTDATED}", details=str(exc)
                 ) from exc
             raise MediaDownloadError(
                 "The download could not be completed. Please try again later.",
@@ -451,14 +458,26 @@ class YtDlpAdapter:
         return tuple(sorted(tracks, key=lambda item: item.normalized_language_code))
 
     @staticmethod
-    def _translate_download_error(exc: DownloadError) -> CaptionForgeError:
+    def _translate_download_error(exc: Exception) -> CaptionForgeError:
         message = str(exc).lower()
         if "private video" in message or "video is private" in message:
             return PrivateVideoError("This video is private and cannot be inspected.")
+        if _is_extractor_stale(message) or "requested format is not available" in (
+            message
+        ):
+            # Checked before "not available" below: when yt-dlp can no longer
+            # read YouTube's player, the streams vanish and yt-dlp reports that
+            # no format is available, which is not the video's fault.
+            return MetadataRefusedError(
+                f"YouTube refused to describe this video. {OUTDATED}",
+                details=str(exc),
+            )
         if any(
             marker in message
             for marker in (
                 "video unavailable",
+                # yt-dlp's wording for an ID that names no video at all.
+                "video is unavailable",
                 "removed",
                 "deleted",
                 "not available",
@@ -478,6 +497,16 @@ class YtDlpAdapter:
         )
 
 
+def _download_errors() -> tuple[type[Exception], ...]:
+    """yt-dlp's DownloadError as imported here, and as currently loaded.
+
+    Updating yt-dlp loads new classes in place, so the one imported at the top
+    of this module stops matching what the new release raises.
+    """
+    loaded = getattr(sys.modules.get("yt_dlp.utils"), "DownloadError", DownloadError)
+    return (DownloadError, loaded)
+
+
 def _is_extractor_stale(message: str) -> bool:
     """Recognize failures that an updated extractor, not a retry, resolves."""
     return any(
@@ -486,7 +515,8 @@ def _is_extractor_stale(message: str) -> bool:
             "403",
             "forbidden",
             "needs to be reloaded",
-            "confirm you're not a bot",
+            # YouTube writes "you’re" with a typographic apostrophe.
+            "not a bot",
             "please sign in",
             "nsig extraction failed",
             "unable to extract",

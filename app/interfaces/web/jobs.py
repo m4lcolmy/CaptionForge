@@ -19,7 +19,7 @@ from app.core.exceptions import (
     TranscriptionCancelledError,
 )
 from app.core.logging_config import get_logger
-from app.interfaces.web.errors import GENERIC_MESSAGE
+from app.interfaces.web.errors import GENERIC_MESSAGE, update_may_help
 from app.models.job import JobStatus
 from app.services.factory import create_media_service, create_transcription_service
 
@@ -74,6 +74,7 @@ class JobRecord:
     percent: float = 0.0
     error: str | None = None
     error_code: str | None = None
+    update_may_help: bool = False
     files: list[OutputFile] = field(default_factory=list)
     used_existing_captions: bool | None = None
     transcription_summary: dict[str, Any] | None = None
@@ -100,6 +101,7 @@ class JobRecord:
                 "percent": round(self.percent, 1),
                 "error": self.error,
                 "error_code": self.error_code,
+                "update_may_help": self.update_may_help,
                 "video_title": self.video_title,
                 "used_existing_captions": self.used_existing_captions,
                 "transcription": self.transcription_summary,
@@ -240,6 +242,7 @@ class JobRegistry:
                 stage="Failed",
                 error=exc.message,
                 error_code=type(exc).__name__,
+                update_may_help=update_may_help(exc),
             )
             return
         except Exception as exc:  # noqa: BLE001 - boundary of the worker thread
@@ -291,6 +294,7 @@ class JobRegistry:
                 stage="Failed",
                 error=exc.message,
                 error_code=type(exc).__name__,
+                update_may_help=update_may_help(exc),
             )
             return
         except Exception as exc:  # noqa: BLE001 - boundary of the worker thread
@@ -377,6 +381,7 @@ class JobRegistry:
         stage: str,
         error: str | None = None,
         error_code: str | None = None,
+        update_may_help: bool = False,
     ) -> None:
         """Move a job to a terminal state."""
         with record.lock:
@@ -384,6 +389,7 @@ class JobRegistry:
             record.stage = stage
             record.error = error
             record.error_code = error_code
+            record.update_may_help = update_may_help
             record.finished_at = datetime.now(UTC)
 
 

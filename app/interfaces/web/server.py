@@ -11,6 +11,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from app.adapters import package_updater
 from app.adapters.whisper_adapter import WhisperAdapter
 from app.core.config import Config
 from app.core.constants import APP_NAME, SUPPORTED_OUTPUT_FORMATS, VERSION
@@ -28,6 +29,7 @@ from app.interfaces.web.schemas import (
     InspectRequest,
     JobRequestBody,
     MediaJobRequestBody,
+    UpdateRequestBody,
 )
 from app.interfaces.web.security import LocalOnlyMiddleware
 from app.services.factory import create_video_service
@@ -156,6 +158,27 @@ def create_app(
             )
         )
         return record.snapshot()
+
+    @application.get("/api/updates")
+    def list_updates(fresh: bool = False) -> dict[str, object]:
+        """Newer releases the page can offer. Nothing is installed here.
+
+        A plain ``def``: pip takes seconds, and FastAPI runs these on a worker
+        thread instead of holding up every other request meanwhile.
+        """
+        updater = package_updater.UPDATER
+        if not config.check_for_updates or not updater.can_update():
+            return {"checked": False, "updates": []}
+        return {
+            "checked": True,
+            "updates": [update.as_dict() for update in updater.check(fresh=fresh)],
+        }
+
+    @application.post("/api/updates")
+    def install_updates(body: UpdateRequestBody) -> dict[str, object]:
+        """Install exactly the packages the person ticked, and nothing else."""
+        installed = package_updater.UPDATER.install(body.packages)
+        return {"updated": [item.as_dict() for item in installed]}
 
     @application.get("/api/jobs/{job_id}")
     async def read_job(job_id: str) -> JSONResponse:

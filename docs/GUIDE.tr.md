@@ -18,8 +18,10 @@ ucuz olanı tercih eder:
    (veya `--force` verildiyse). Sadece ses akışı indirilir, mono 16 kHz PCM WAV'a
    dönüştürülür ve yerel makinede `faster-whisper`'a verilir.
 
-Hiçbir yolda video akışı indirilmez. YouTube (`yt-dlp` üzerinden) ve ilk model
-indirmesinde Whisper model sunucusu dışında hiçbir servise ağ çağrısı yapılmaz.
+Hiçbir yolda video akışı indirilmez. YouTube (`yt-dlp` üzerinden), ilk model
+indirmesinde Whisper model sunucusu ve CaptionForge kendi paketlerinin yeni
+sürümlerini ararken PyPI dışında hiçbir servise ağ çağrısı yapılmaz. Bu
+paketlerin hiçbiri sorulmadan kurulmaz.
 
 ---
 
@@ -29,6 +31,8 @@ indirmesinde Whisper model sunucusu dışında hiçbir servise ağ çağrısı y
 app/
 ├── main.py              giriş noktası → app.interfaces.cli:app  ("captionforge" konsol betiği)
 ├── interfaces/cli.py    Typer komutları, Rich çıktısı, hata→çıkış kodu eşlemesi
+├── interfaces/desktop.py   web uygulamasına tek örnek, bir pencere ve bir ömür ekler
+├── interfaces/launcher.py  uygulamayı başlatan menü girdisini yazar
 ├── services/            orkestrasyon; iş akışının kararlaştırıldığı tek yer
 │   ├── video_service.py         URL doğrulama + canlı/erişilebilirlik kontrolleri + keşif
 │   ├── subtitle_service.py      iz seçimi, altyazı ayrıştırma, asgari temizlik
@@ -95,6 +99,7 @@ Pratikte önem taşıyan doğrulama kuralları:
 | `default_output_formats` | virgüllü metin veya tuple; boş olamaz ve srt/vtt/txt/json/docx alt kümesi olmalı |
 | `whisper_language`, `whisper_model_download_directory` | boş metin `None`'a (tanımsız) çevrilir |
 | `retry_count` | 1–10 |
+| `check_for_updates` | `true` (varsayılan) sayfa açıldığında ve YouTube yt-dlp'yi reddettiğinde güncelleme arar; `false` yalnızca `captionforge update` ile arar. Kurmadan önce her zaman sorar. |
 
 ---
 
@@ -110,11 +115,43 @@ Pratikte önem taşıyan doğrulama kuralları:
 | `transcribe` | meta veri + (altyazı **veya** ses) | evet | altyazı öncelikli, Whisper yedekli |
 | `prepare-audio` | meta veri + ses | yalnızca WAV | `AudioService.prepare` |
 | `clean` | yok | evet | yerel dosya → ayrıştır → son işleme → dışa aktar |
+| `web` | sayfanın istediği kadar | evet | `127.0.0.1` üzerinde FastAPI |
+| `desktop` | sayfanın istediği kadar | evet | aynı uygulama, bir pencerede |
+| `install-desktop` | hayır | bir masaüstü girdisi ve bir simge | `interfaces/launcher.py` |
+| `update` | PyPI | seçtiğiniz paketler | `PackageUpdater.check` → sor → `install` |
 
 Her komut `_run_with_config` üzerinden geçer ve aynı dört işi yapar:
 yapılandırmayı yükle, loglamayı ayarla, eylemi çalıştır, istisnaları kısa bir
-kullanıcı mesajı ile bir çıkış koduna çevir. Ham `yt-dlp`, FFmpeg, CUDA veya
+kullanıcı mesajı ile bir çıkış koduna çevir. Eylem `ExtractorRefusedError` ile
+başarısız olursa ve terminalde biri varsa, önce daha yeni bir yt-dlp önerir;
+kurulduysa eylemi bir kez daha çalıştırır. Ham `yt-dlp`, FFmpeg, CUDA veya
 Python metni asla stdout/stderr'e ulaşmaz — log dosyasına gider.
+
+### Masaüstü kipi
+
+`captionforge desktop` ([app/interfaces/desktop.py](../app/interfaces/desktop.py))
+tam olarak `web`'in sunduğunu sunar — aynı `create_app`, aynı token, aynı sayfa.
+Yalnızca bir uygulamanın ihtiyaç duyduğu, sunulan bir sayfanın duymadığı üç
+davranışı ekler:
+
+1. **Tek örnek.** Port ve token
+   `$XDG_RUNTIME_DIR/captionforge-desktop-<uid>.json` dosyasına yazılır. İkinci
+   çalıştırma o sunucunun `/api/health` adresini yoklar; yanıt gelirse yalnızca
+   onun adresini açar ve çıkar. Çökmeden kalan kayıt yoklamada elenir ve silinir.
+2. **Elden geldiğince pencere.** Kuruluysa `pywebview`, değilse `--app=<url>` ile
+   başlatılan Chromium ailesinden bir tarayıcı (sekme şeridi ve adres çubuğu
+   olmayan bir pencere), o da yoksa `webbrowser.open`. Yalnızca ilki bloklar;
+   diğer ikisinde sunucu iş parçacığı beklenir.
+3. **Bir ömür.** `ActivityMiddleware` her isteği zaman damgalar; sayfa her 20
+   saniyede bir `/api/health` yoklar. `IDLE_GRACE_SECONDS` (90 sn) boyunca hiç
+   istek gelmezse gözcü `server.should_exit` bayrağını kaldırır — `JobRegistry`
+   içinde bitmemiş bir iş varsa süre sıfırlanır ve önce iş tamamlanır. `SIGTERM`
+   (oturum kapatma) da aynı düzgün yoldan gider.
+
+`install-desktop` ([app/interfaces/launcher.py](../app/interfaces/launcher.py))
+`<sys.executable> -m app desktop` çalıştıran bir girdi yazar ve `Path=` alanını
+kurulumun yapıldığı klasöre ayarlar; göreli `default_output_folder`, `temp/` ve
+`logs/` yollarının komut satırındakiyle aynı yere düşmesini sağlayan budur.
 
 ### Çıkış kodları
 
@@ -454,6 +491,51 @@ yapılandırılabilir; gecikme sabittir, üstel değildir.
 `UnsupportedModelError`'ın `ModelLoadError`'dan `retryable = True` miras aldığını
 unutmayın: gerçekten hatalı bir model adı da başarısız olmadan önce `retry_count`
 kez denenir.
+
+**Eskimiş yt-dlp.** YouTube sitesini birkaç haftada bir değiştirir ve eski yt-dlp
+sürümlerini reddetmeye başlar: HTTP 403, "Sign in to confirm you're not a bot",
+"nsig extraction failed", "Unable to extract" ya da tüm formatların kaybolması
+(inceleme sırasında "Requested format is not available"). Yeniden denemek bunu
+asla düzeltmez; bu yüzden bu hatalar yeniden denenmez, `ExtractorRefusedError`
+olarak işaretlenir (`MetadataRefusedError`, `SubtitleStreamForbiddenError`,
+`AudioStreamForbiddenError`, `MediaStreamForbiddenError`).
+
+Adaptör yalnızca reddi bildirir. Ne yapılacağına arayüz karar verir ve iki
+arayüz de bir şey kurmadan önce sorar:
+
+- **Terminal.** `_run_with_config` reddi yakalar. `check_for_updates` açıksa,
+  pip varsa ve stdin ile stdout bir TTY ise taze bir kontrol yapar ve mevcut
+  tüm güncellemeleri listeler. yt-dlp ilk sırada gelir ve varsayılanı evettir;
+  diğerlerinin varsayılanı hayırdır. yt-dlp kurulduysa komut bir kez daha
+  çalışır. Bir betikten çalışırken soru sormak yerine "Run 'captionforge
+  update'" yazdırır.
+- **Sayfa.** `/api/inspect` hataları ve başarısız iş anlık görüntüleri
+  `update_may_help` taşır. Sayfa bunun üzerine `/api/updates?fresh=1` ister ve
+  güncellemeler satırını yt-dlp işaretli olarak gösterir. "Update selected"
+  işaretli adları `/api/updates`'e gönderene kadar hiçbir şey kurulmaz.
+
+**Güncellemeler.** `PackageUpdater` ([app/adapters/package_updater.py](../app/adapters/package_updater.py))
+sabit bir listeye sahiptir: `PACKAGES`. Bu liste CaptionForge'un doğrudan
+bağımlılıklarını içerir. Her birinin `pyproject.toml`'daki sürüm aralığı (bir
+test ikisini aynı tutar) ve önerildiği her yerde yanında gösterilen tek satırlık
+bir *görevi* vardır.
+
+- `check()`, kurulu olanlar üzerinde `pip install --upgrade --dry-run --report -`
+  çalıştırır; neyin daha yeni olduğuna pip'in kendi indeks ayarları ve
+  çözümleyicisi karar verir. Hiçbir şey kurulmaz. Taze bir yanıt istenmedikçe
+  sonuç altı saat boyunca yeniden kullanılır. Sayfa açılışta sorar; bir ret ve
+  `captionforge update` taze sorar.
+- `install(names)` yalnızca `PACKAGES` içindeki adları kabul eder, bir isteğin
+  gönderdiklerini asla kabul etmez, ve tam olarak onları yükseltir.
+- Yeni bir yt-dlp yerinde yüklenir: tüm `yt_dlp` modülleri `sys.modules`'tan
+  çıkarılıp yeniden içe aktarılır, böylece açık bir sayfa onu hemen kullanır.
+  Adaptörün `yt_dlp.YoutubeDL` ve `DownloadError`'ı her çağrıda yeniden araması
+  bu yüzdendir. Diğer paketler zaten içe aktarılmışlarsa `restart_needed`
+  bildirir.
+- Süreç başına tek bir güncelleyici (`UPDATER`) ve tek bir kilit vardır; bir
+  kontrol ile bir kurulum asla aynı anda pip çalıştırmaz.
+- pip yoksa (veya paketlenmiş bir çalıştırılabilir dosyada) hiçbir şey
+  çalışmaz; `doctor` bunu söyler.
 
 **Loglama.** `configure_logging`, Loguru'nun varsayılan handler'ını kaldırır ve
 **yalnızca bir dosya sink'i** ekler — `logs/captionforge_YYYY-MM-DD.log`, 10

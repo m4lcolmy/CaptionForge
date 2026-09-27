@@ -16,6 +16,18 @@ class CaptionForgeError(Exception):
         return False
 
 
+class ExtractorRefusedError(CaptionForgeError):
+    """Marks a refusal from YouTube that a newer yt-dlp, not a retry, resolves.
+
+    The terminal and the page both answer one of these by offering to update
+    yt-dlp, and install it only if the person agrees.
+    """
+
+
+class PackageUpdateError(CaptionForgeError):
+    """Raised when pip cannot check for, or install, a package update."""
+
+
 class ConfigurationError(CaptionForgeError):
     """Raised when application configuration is invalid or unavailable."""
 
@@ -52,6 +64,15 @@ class MetadataRetrievalError(VideoError):
         return True
 
 
+class MetadataRefusedError(MetadataRetrievalError, ExtractorRefusedError):
+    """Raised when YouTube refuses the installed yt-dlp while describing a video."""
+
+    @property
+    def retryable(self) -> bool:
+        # Asking again with the same yt-dlp gets the same refusal.
+        return False
+
+
 class SubtitleError(CaptionForgeError):
     """Base class for subtitle failures."""
 
@@ -68,7 +89,7 @@ class SubtitleDownloadError(SubtitleError):
         return True
 
 
-class SubtitleStreamForbiddenError(SubtitleDownloadError):
+class SubtitleStreamForbiddenError(SubtitleDownloadError, ExtractorRefusedError):
     """Raised when YouTube refuses the caption track URL outright."""
 
     @property
@@ -96,7 +117,7 @@ class AudioFormatUnavailableError(AudioDownloadError):
     """Raised when YouTube provides no usable audio stream."""
 
 
-class AudioStreamForbiddenError(AudioDownloadError):
+class AudioStreamForbiddenError(AudioDownloadError, ExtractorRefusedError):
     """Raised when YouTube refuses the audio stream URL outright."""
 
     @property
@@ -148,6 +169,10 @@ class MediaFormatUnavailableError(MediaDownloadError):
     @property
     def retryable(self) -> bool:
         return False
+
+
+class MediaStreamForbiddenError(MediaFormatUnavailableError, ExtractorRefusedError):
+    """Raised when YouTube refuses the video or audio stream URL outright."""
 
 
 class MediaDownloadCancelledError(MediaError):

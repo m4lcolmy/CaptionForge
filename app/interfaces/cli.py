@@ -3,6 +3,7 @@
 import os
 import platform
 import shutil
+import sys
 import webbrowser
 from collections.abc import Callable
 from importlib.metadata import PackageNotFoundError
@@ -17,6 +18,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from app.adapters.ffmpeg_adapter import FFmpegAdapter
+from app.adapters.package_updater import UPDATER, AvailableUpdate, InstalledUpdate
 from app.adapters.whisper_adapter import WhisperAdapter
 from app.adapters.ytdlp_adapter import YtDlpAdapter
 from app.core.config import Config
@@ -24,6 +26,7 @@ from app.core.constants import APP_NAME, VERSION, ExitCode
 from app.core.exceptions import (
     CaptionForgeError,
     ConfigurationError,
+    ExtractorRefusedError,
     InvalidYouTubeUrlError,
     LiveStreamNotSupportedError,
     MetadataRetrievalError,
@@ -62,10 +65,18 @@ error_console = Console(stderr=True)
 
 def _run_with_config(action: Callable[[Config], None]) -> None:
     """Load configuration, initialize logging, and run a CLI action."""
+    offered = False
     try:
         config = Config.load()
         configure_logging(config)
-        action(config)
+        try:
+            action(config)
+        except ExtractorRefusedError:
+            offered = _can_offer_updates(config)
+            if not offered or not _update_after_refusal():
+                raise
+            # The approved yt-dlp is loaded now, so the command gets one more go.
+            action(config)
     except CaptionForgeError as exc:
         get_logger().error(
             "Command failed user_message={} technical_cause={}",
@@ -73,8 +84,13 @@ def _run_with_config(action: Callable[[Config], None]) -> None:
             exc.details or type(exc).__name__,
         )
         error_console.print(f"[bold red]Error:[/bold red] {exc.message}")
+        if isinstance(exc, ExtractorRefusedError) and not offered:
+            error_console.print(
+                "Run 'captionforge update' to check for a newer yt-dlp."
+            )
         raise typer.Exit(code=_exit_code_for(exc)) from exc
-    except KeyboardInterrupt as exc:
+    except (KeyboardInterrupt, typer.Abort) as exc:
+        # Abort is Ctrl+D at one of the update questions: a cancel, like Ctrl+C.
         get_logger().warning("Command cancelled by user")
         error_console.print(
             "[yellow]Cancelled:[/yellow] No incomplete output was kept."
@@ -187,6 +203,7 @@ def doctor() -> None:
         except PackageNotFoundError:
             table.add_row("yt-dlp installed", "No")
             table.add_row("yt-dlp version", "Not available")
+        table.add_row("Package updates", _updates_status(config))
         try:
             whisper_version = package_version("faster-whisper")
             table.add_row("faster-whisper installed", "Yes")
@@ -709,6 +726,112 @@ def web(
     _run_with_config(run)
 
 
+@app.command()
+def desktop(
+    port: int = typer.Option(
+        0, "--port", help="Port to bind on 127.0.0.1; 0 chooses a free one."
+    ),
+    window: bool = typer.Option(
+        True,
+        "--window/--browser",
+        help="Open a window of its own, or a tab in your usual browser.",
+    ),
+) -> None:
+    """Open CaptionForge as a desktop app, with no terminal to keep open."""
+
+    def run(config: Config) -> None:
+        from app.interfaces.desktop import launch
+
+        def announce(url: str, joined: bool) -> None:
+            opening = "Opening the CaptionForge already running at"
+            console.print(
+                Panel(
+                    f"[bold green]{url}[/bold green]\n\n"
+                    "Everything runs on this computer. Close the window to "
+                    "stop it;\nunfinished downloads and transcriptions still "
+                    "finish first.",
+                    title=opening if joined else f"{APP_NAME} is open",
+                    border_style="green",
+                )
+            )
+
+        launch(config, port=port, window=window, announce=announce)
+
+    _run_with_config(run)
+
+
+@app.command()
+def update(
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Install every available update without asking."
+    ),
+) -> None:
+    """Check CaptionForge's packages for updates, and install the ones you pick."""
+
+    def run(config: Config) -> None:
+        with console.status("Checking for updates…"):
+            updates = UPDATER.check(fresh=True)
+        if not updates:
+            console.print("Everything is up to date.")
+            return
+        if yes:
+            for update in updates:
+                _show_update(update)
+            console.print()
+            chosen = [update.name for update in updates]
+        else:
+            chosen = _choose_updates(updates, suggested=lambda _update: True)
+        _install_updates(chosen)
+
+    _run_with_config(run)
+
+
+@app.command(name="install-desktop")
+def install_desktop(
+    remove: bool = typer.Option(
+        False, "--remove", help="Remove the entry instead of adding it."
+    ),
+    workdir: Annotated[
+        Path | None,
+        typer.Option(
+            "--workdir",
+            help="Folder the app runs in. Output, temp, and logs land here. "
+            "Defaults to the current folder.",
+        ),
+    ] = None,
+) -> None:
+    """Add CaptionForge to this computer's applications, or take it away."""
+
+    def run(config: Config) -> None:
+        from app.interfaces.launcher import install, uninstall
+
+        if remove:
+            removed = uninstall()
+            if not removed:
+                console.print("[yellow]Nothing to remove:[/yellow] no entry was found.")
+                return
+            for path in removed:
+                console.print(f"[bold green]Removed:[/bold green] {path}")
+            return
+
+        installed = install(workdir)
+        written = "\n".join(str(path) for path in installed.paths)
+        console.print(
+            Panel(
+                f"[bold green]{APP_NAME}[/bold green] is now in your "
+                "applications.\nSearch for it by name and start it like any "
+                "other app.\n\n"
+                f"Runs in: {installed.workdir}\n"
+                f"Command: {' '.join(installed.command)}\n\n"
+                f"{written}",
+                title="Installed",
+                border_style="green",
+            )
+        )
+
+    _run_with_config(run)
+
+
 def _clean_destination(input_file: Path, output: Path | None) -> Path:
     """Resolve a predictable cleaned filename without changing formats."""
     suffix = input_file.suffix.lower()
@@ -870,6 +993,96 @@ def _planned_configuration(config: Config) -> str:
     if planned == requested:
         return planned.describe()
     return f"{planned.describe()} - reduced from {requested.model_name} to fit"
+
+
+def _updates_status(config: Config) -> str:
+    """Say when CaptionForge looks for updates; it always asks before installing."""
+    if not UPDATER.can_update():
+        return "Unavailable - this Python has no pip"
+    if not config.check_for_updates:
+        return "Asks first; checks only when you run 'captionforge update'"
+    return "Asks first; checks when the page opens or YouTube refuses yt-dlp"
+
+
+def _interactive() -> bool:
+    """Whether someone is at the terminal to answer a question."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _can_offer_updates(config: Config) -> bool:
+    return config.check_for_updates and UPDATER.can_update() and _interactive()
+
+
+def _update_after_refusal() -> bool:
+    """Offer a newer yt-dlp after YouTube refused this one; True once it is loaded."""
+    console.print(
+        "[yellow]YouTube refused the installed yt-dlp.[/yellow] Checking for updates…"
+    )
+    try:
+        updates = UPDATER.check(fresh=True)
+    except CaptionForgeError as exc:
+        error_console.print(f"[yellow]{exc.message}[/yellow]")
+        return False
+    if not any(update.name == "yt-dlp" for update in updates):
+        version = UPDATER.installed_version("yt-dlp") or "installed"
+        console.print(
+            f"yt-dlp {version} is already the newest release, so YouTube may be "
+            "limiting this connection. Try again later."
+        )
+        return False
+    # yt-dlp is the fix, so it is offered first and suggested; anything else is
+    # there to pick, but not pushed.
+    chosen = _choose_updates(updates, suggested=lambda update: update.name == "yt-dlp")
+    installed = _install_updates(chosen)
+    ytdlp = next((item for item in installed if item.name == "yt-dlp"), None)
+    if ytdlp is None or ytdlp.restart_needed:
+        return False
+    console.print(f"Trying again with yt-dlp {ytdlp.version}.")
+    return True
+
+
+def _show_update(update: AvailableUpdate) -> None:
+    console.print(
+        f"\n[bold]{update.name}[/bold]  {update.installed} → {update.latest}\n"
+        f"  [dim]{escape(update.package.mission)}[/dim]"
+    )
+
+
+def _choose_updates(
+    updates: tuple[AvailableUpdate, ...],
+    *,
+    suggested: Callable[[AvailableUpdate], bool],
+) -> list[str]:
+    """Ask about each update in turn, saying what the package is for."""
+    count = len(updates)
+    console.print(f"{count} update{'s' if count != 1 else ''} available:")
+    chosen: list[str] = []
+    for update in updates:
+        _show_update(update)
+        if typer.confirm(f"  Update {update.name}?", default=suggested(update)):
+            chosen.append(update.name)
+    return chosen
+
+
+def _install_updates(names: list[str]) -> tuple[InstalledUpdate, ...]:
+    """Install exactly what was chosen and report each result."""
+    if not names:
+        console.print("Nothing was updated.")
+        return ()
+    with console.status(f"Updating {', '.join(names)}…"):
+        installed = UPDATER.install(names)
+    for item in installed:
+        later = (
+            "; it takes effect the next time CaptionForge starts"
+            if item.restart_needed
+            else ""
+        )
+        console.print(
+            f"[bold green]Updated[/bold green] {item.name} to {item.version}{later}"
+        )
+    for name in sorted(set(names) - {item.name for item in installed}):
+        console.print(f"{name} was already up to date.")
+    return installed
 
 
 def _javascript_runtime_status() -> str:

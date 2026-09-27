@@ -12,6 +12,7 @@ the page's download row.
 ## Features
 
 - Run the whole workflow from a browser on your own machine
+- Or install it as a desktop app and start it from your applications list
 - Inspect video metadata and available caption tracks
 - Select captions by preferred language
 - Save the video as MP4 at any quality it publishes, or the audio as MP3
@@ -45,6 +46,13 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
 python -m pip install -e ".[transcription]"
 python -m pip install -e ".[web]"
+```
+
+The desktop app needs nothing beyond `[web]`. A native window instead of a
+browser one is optional:
+
+```bash
+python -m pip install -e ".[desktop]"
 ```
 
 ## Web interface
@@ -84,6 +92,54 @@ the per-process token from that link, requests addressed to any other hostname
 are refused, and downloads are restricted to the files the job actually wrote.
 The page loads no fonts, scripts, or styles from the internet, so it works with
 the network unplugged once a caption track or model is already local.
+
+## Desktop app
+
+Add CaptionForge to this computer's applications, so it starts from an icon
+instead of a terminal:
+
+```bash
+captionforge install-desktop
+```
+
+Search your applications for **CaptionForge** and start it like any other app.
+It opens in a window of its own, serving the same page `captionforge web`
+serves. Nothing has to stay open behind it.
+
+The entry runs `captionforge desktop` from the folder you were in when you
+installed it, so output, `temp/`, and `logs/` land exactly where they land when
+you run the commands by hand. Install from somewhere else with `--workdir`, and
+undo the whole thing with `--remove`:
+
+```bash
+captionforge install-desktop --workdir ~/Videos/CaptionForge
+captionforge install-desktop --remove
+```
+
+You can also start the app without installing anything:
+
+```bash
+captionforge desktop            # a window of its own
+captionforge desktop --browser  # a tab in your usual browser
+```
+
+What the window is depends on what you have, in this order: a native window if
+[`pywebview`](https://pywebview.flowrl.com/) is installed, otherwise a
+chromeless window from a Chromium-family browser (Chrome, Chromium, Brave,
+Edge, Vivaldi), otherwise a normal tab in your default browser.
+
+Three things make it behave like an application rather than a served page:
+
+- **Starting it twice does not start two of them.** The second launch finds the
+  first, opens its page, and exits.
+- **Closing the window stops the server.** The open page pings the server every
+  20 seconds; after 90 seconds of silence the server stops by itself.
+- **Closing the window never abandons work.** A download or a transcription that
+  is already running finishes and writes its files first.
+
+On Linux this writes a `.desktop` entry and an icon under
+`~/.local/share`; on macOS a small bundle in `~/Applications`; on Windows a
+Start Menu shortcut. Only the Linux entry has been verified on real hardware.
 
 ## Usage
 
@@ -179,6 +235,23 @@ than replaced unless `--overwrite` is passed. Sizes shown before a download are
 estimates read from the stream metadata, usually within a few percent.
 
 `captionforge prepare-audio` remains available for audio-only diagnostics.
+
+CaptionForge never updates anything without asking. `captionforge update` lists
+newer releases of the packages it uses, each with a line saying what that
+package does, and asks about each one before installing it:
+
+```bash
+captionforge update        # choose one by one
+captionforge update --yes  # install everything listed
+```
+
+The page asks the same question: when it opens and something newer exists, an
+"Updates available" row lists the packages with checkboxes, all unticked.
+Updates stay inside the version ranges in `pyproject.toml`. A new yt-dlp is
+used straight away; other packages take effect the next time CaptionForge
+starts. `captionforge config set check_for_updates false` stops CaptionForge
+from looking by itself; `captionforge update` still works.
+
 Run `captionforge doctor` to check FFmpeg, yt-dlp, faster-whisper, python-docx,
 CUDA, the detected GPU, recommendations, and folder access. Doctor never
 downloads a model.
@@ -249,6 +322,7 @@ CAPTIONFORGE_NORMALIZE_ARABIC_INDIC_DIGITS=false
 CAPTIONFORGE_RETRY_COUNT=3
 CAPTIONFORGE_RETRY_DELAY_SECONDS=1.0
 CAPTIONFORGE_MINIMUM_FREE_DISK_BYTES=104857600
+CAPTIONFORGE_CHECK_FOR_UPDATES=true
 ```
 
 `CAPTIONFORGE_CONFIG_FILE` may point to another config file. Invalid persisted
@@ -273,11 +347,13 @@ files unless preservation was requested.
 - Run `captionforge doctor` to check FFmpeg, CUDA, dependencies, disk paths, and
   write access.
 - **HTTP 403 on audio or captions** means yt-dlp can no longer read YouTube's
-  current site. Retrying never fixes it; upgrade instead:
-
-  ```bash
-  python -m pip install --upgrade yt-dlp
-  ```
+  current site. Retrying never fixes it; a newer yt-dlp does. When this
+  happens in a terminal, CaptionForge checks for one, shows it, and asks
+  "Update yt-dlp?". If you say yes, it installs it and runs your command once
+  more. On the page, the same refusal brings up the updates row with yt-dlp
+  ticked, waiting for "Update selected". If yt-dlp is already the newest
+  release, YouTube is probably limiting your connection; try again later. From
+  a script (no terminal to ask), run `captionforge update` afterwards.
 
   yt-dlp also wants a JavaScript runtime (`deno`) for signature extraction and
   has deprecated working without one. `doctor` reports whether you have it.
@@ -367,6 +443,7 @@ Run optional integrations explicitly:
 - No live streams, playlists, or translation
 - MP4 downloads offer 360p to 2160p, and only the heights a video publishes; other heights are not re-encoded into existence
 - The web interface covers `extract`, `transcribe`, and `download` only; settings, `clean`, `doctor`, and local file input stay on the command line
+- The desktop app is the same page in a window; the applications-menu entry has been verified on Linux only
 - No authenticated or cookie-based access
 - No speaker diarization, translation, or aggressive spelling/grammar rewriting
 

@@ -5,6 +5,7 @@
 
   const POLL_INTERVAL_MS = 700;
   const SAVE_DELAY_MS = 600;
+  const HEARTBEAT_MS = 20000;
 
   // Sizes are the on-disk faster-whisper downloads, rounded.
   const WHISPER_MODELS = [
@@ -21,6 +22,10 @@
     meta: el("meta"), form: el("source-form"), url: el("url"),
     inspect: el("inspect-btn"), hint: el("hint"),
     alert: el("alert"), alertTitle: el("alert-title"), alertBody: el("alert-body"),
+    updates: el("updates"), updatesLabel: el("updates-label"),
+    updateList: el("update-list"), updateActions: el("update-actions"),
+    updateBtn: el("update-btn"), updateLater: el("update-later"),
+    updatesNote: el("updates-note"),
     video: el("video"), thumb: el("thumb"), title: el("title"), byline: el("byline"),
     media: el("media"), mediaList: el("media-list"), mediaNote: el("media-note"),
     tracks: el("tracks"), trackList: el("track-list"), selection: el("selection"),
@@ -47,6 +52,7 @@
     timer: null,
     preferences: {},
     saveTimer: null,
+    updateCheck: 0,
   };
 
   /* ---------- token ---------- */
@@ -82,7 +88,9 @@
       const message = payload && payload.error
         ? payload.error
         : detailOf(payload) || "CaptionForge could not complete the request.";
-      throw new Error(message);
+      const failure = new Error(message);
+      failure.payload = payload;
+      throw failure;
     }
     return payload;
   }
@@ -114,6 +122,8 @@
     for (const chip of ui.mediaList.querySelectorAll("button")) {
       chip.disabled = isBusy;
     }
+    // Swapping a package out from under a running job helps nobody either.
+    syncUpdateButton();
   }
 
   function formatDuration(seconds) {
@@ -155,6 +165,18 @@
     state.preferences = state.defaults.preferences || {};
     applyPreferences();
     watchForChanges();
+    keepAlive();
+    offerUpdates();
+  }
+
+  // The desktop app has no terminal to close, so its server stops once no page
+  // is asking it for anything. An open page keeps saying that it is still here.
+  function keepAlive() {
+    setInterval(() => {
+      api("/api/health").catch(() => {
+        // A missed heartbeat is not worth an alert; the next one may land.
+      });
+    }, HEARTBEAT_MS);
   }
 
   function applyPreferences() {
@@ -356,6 +378,9 @@
       ui.media.hidden = true;
       ui.tracks.hidden = true;
       showAlert("Could not read that video", error.message);
+      if (error.payload && error.payload.update_may_help) {
+        offerUpdates({ refused: true });
+      }
     } finally {
       busy(false);
       ui.inspect.textContent = "Look up";
@@ -594,6 +619,7 @@
     ui.progress.hidden = true;
     if (job.status === "failed") {
       showAlert("Job failed", job.error || "CaptionForge could not finish.");
+      if (job.update_may_help) offerUpdates({ refused: true });
       return;
     }
     if (job.status === "cancelled") {
@@ -652,6 +678,134 @@
     return job.used_existing_captions
       ? "Exported the video's own captions"
       : "Transcribed on this computer";
+  }
+
+  /* ---------- updates ---------- */
+
+  // Nothing is installed without a tick from the person. The row appears only
+  // when something newer exists, and says what each package does, so the
+  // choice can be made without looking anything up.
+  async function offerUpdates({ refused = false } = {}) {
+    // The check on arrival can answer after a later one made for a refusal;
+    // only the newest question's answer may redraw the row.
+    const ticket = ++state.updateCheck;
+    let result;
+    try {
+      // After a refusal the answer has to be current: yt-dlp may have shipped
+      // a fix since the page last asked.
+      result = await api(`/api/updates${refused ? "?fresh=1" : ""}`);
+    } catch {
+      // Offline, or pip is unhappy. The work on the page matters more.
+      return;
+    }
+    if (ticket !== state.updateCheck) return;
+    const updates = result.updates || [];
+    const ytdlp = updates.some((update) => update.name === "yt-dlp");
+    if (refused && result.checked && !ytdlp) {
+      ui.alertBody.textContent += " yt-dlp is already the newest release, so " +
+        "YouTube may be limiting this connection. Try again later.";
+    }
+    renderUpdates(updates, refused && ytdlp ? new Set(["yt-dlp"]) : new Set());
+    if (refused && ytdlp) {
+      ui.updatesNote.textContent =
+        "A newer yt-dlp usually fixes this. Nothing installs until you click Update selected.";
+    }
+  }
+
+  function renderUpdates(updates, ticked) {
+    ui.updateList.replaceChildren();
+    if (!updates.length) {
+      ui.updates.hidden = true;
+      return;
+    }
+    for (const update of updates) {
+      const label = document.createElement("label");
+      label.className = "radio";
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.value = update.name;
+      box.checked = ticked.has(update.name);
+      box.addEventListener("change", syncUpdateButton);
+      const text = document.createElement("span");
+      const name = document.createElement("b");
+      name.textContent = `${update.name} ${update.installed} → ${update.latest}`;
+      const mission = document.createElement("em");
+      mission.textContent = update.mission;
+      text.append(name, mission);
+      label.append(box, text);
+      ui.updateList.append(label);
+    }
+    ui.updatesLabel.textContent = "Updates available";
+    ui.updatesNote.textContent = "Nothing is installed until you tick it.";
+    ui.updateList.hidden = false;
+    ui.updateActions.hidden = false;
+    syncUpdateButton();
+    ui.updates.hidden = false;
+  }
+
+  function tickedUpdates() {
+    return [...ui.updateList.querySelectorAll("input:checked")]
+      .map((box) => box.value);
+  }
+
+  function syncUpdateButton() {
+    ui.updateBtn.disabled = state.running || !tickedUpdates().length;
+  }
+
+  ui.updateBtn.addEventListener("click", async () => {
+    const packages = tickedUpdates();
+    if (!packages.length || state.running) return;
+    const boxes = [...ui.updateList.querySelectorAll("input")];
+    busy(true);
+    for (const box of boxes) box.disabled = true;
+    ui.updateLater.disabled = true;
+    ui.updateBtn.textContent = "Updating…";
+    try {
+      const result = await api("/api/updates", {
+        method: "POST",
+        body: JSON.stringify({ packages }),
+      });
+      reportUpdates(packages, result.updated || []);
+    } catch (error) {
+      showAlert("Could not update", error.message);
+    } finally {
+      for (const box of boxes) box.disabled = false;
+      ui.updateLater.disabled = false;
+      ui.updateBtn.textContent = "Update selected";
+      busy(false);
+    }
+  });
+
+  ui.updateLater.addEventListener("click", () => {
+    ui.updates.hidden = true;
+  });
+
+  function reportUpdates(requested, updated) {
+    for (const box of [...ui.updateList.querySelectorAll("input")]) {
+      if (requested.includes(box.value)) box.closest("label").remove();
+    }
+    const now = updated.filter((item) => !item.restart_needed);
+    const later = updated.filter((item) => item.restart_needed);
+    const lines = [];
+    if (now.length) {
+      lines.push(`Updated ${now.map((item) => `${item.name} to ${item.version}`).join(", ")}.`);
+    }
+    if (later.length) {
+      lines.push(
+        `Installed ${later.map((item) => `${item.name} ${item.version}`).join(", ")}; ` +
+        "restart CaptionForge to start using it."
+      );
+    }
+    if (!updated.length) lines.push("Everything you picked was already up to date.");
+    if (now.some((item) => item.name === "yt-dlp") && !ui.alert.hidden) {
+      clearAlert();
+      lines.push("Try again.");
+    }
+    const remaining = ui.updateList.querySelectorAll("input").length;
+    ui.updateList.hidden = !remaining;
+    ui.updateActions.hidden = !remaining;
+    ui.updatesLabel.textContent = remaining ? "Updates available" : "Updated";
+    ui.updatesNote.textContent = lines.join(" ");
   }
 
   start();

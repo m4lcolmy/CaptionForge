@@ -33,6 +33,7 @@ def test_doctor_reports_audio_dependencies(
     assert "FFmpeg installed" in result.stdout
     assert "FFmpeg version" in result.stdout
     assert "yt-dlp installed" in result.stdout
+    assert "Package updates" in result.stdout
     assert "Writable temporary folder" in result.stdout
 
 

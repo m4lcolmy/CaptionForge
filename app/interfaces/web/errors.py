@@ -7,6 +7,7 @@ from app.core.exceptions import (
     CaptionForgeError,
     ConfigurationError,
     DocxNotInstalledError,
+    ExtractorRefusedError,
     FFmpegNotFoundError,
     InsufficientDiskSpaceError,
     InvalidYouTubeUrlError,
@@ -14,6 +15,7 @@ from app.core.exceptions import (
     MediaDownloadError,
     MediaFormatUnavailableError,
     MetadataRetrievalError,
+    PackageUpdateError,
     SubtitleDownloadError,
     UnsupportedModelError,
     UnsupportedYouTubeUrlError,
@@ -44,6 +46,7 @@ _STATUS_BY_ERROR: tuple[tuple[type[CaptionForgeError], int], ...] = (
     (SubtitleDownloadError, HTTPStatus.BAD_GATEWAY),
     (AudioDownloadError, HTTPStatus.BAD_GATEWAY),
     (MediaDownloadError, HTTPStatus.BAD_GATEWAY),
+    (PackageUpdateError, HTTPStatus.BAD_GATEWAY),
 )
 
 
@@ -61,4 +64,10 @@ def body_for(error: CaptionForgeError) -> dict[str, object]:
         "error": error.message,
         "code": type(error).__name__,
         "retryable": error.retryable,
+        "update_may_help": update_may_help(error),
     }
+
+
+def update_may_help(error: CaptionForgeError) -> bool:
+    """Whether YouTube refused yt-dlp, so the page should offer a newer one."""
+    return isinstance(error, ExtractorRefusedError)

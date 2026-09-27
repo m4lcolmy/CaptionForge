@@ -47,6 +47,14 @@ class JobRequestBody(BaseModel):
         return value
 
 
+class UpdateRequestBody(BaseModel):
+    """The packages the person ticked; the updater accepts only its own names."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    packages: tuple[str, ...] = Field(min_length=1, max_length=32)
+
+
 class MediaJobRequestBody(BaseModel):
     """A request to download the whole file as an MP4 or an MP3."""
 

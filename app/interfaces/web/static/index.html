@@ -37,6 +37,16 @@
     <span id="alert-body"></span>
   </section>
 
+  <section class="updates" id="updates" hidden>
+    <h3 class="label" id="updates-label">Updates available</h3>
+    <div class="radio-list" id="update-list" role="group" aria-labelledby="updates-label"></div>
+    <div class="updates-actions" id="update-actions">
+      <button type="button" class="btn-ghost" id="update-btn" disabled>Update selected</button>
+      <button type="button" class="btn-quiet" id="update-later">Not now</button>
+    </div>
+    <p class="note" id="updates-note">Nothing is installed until you tick it.</p>
+  </section>
+
   <section class="video" id="video" hidden>
     <img id="thumb" alt="" width="160" height="90" referrerpolicy="no-referrer">
     <div class="video-text">

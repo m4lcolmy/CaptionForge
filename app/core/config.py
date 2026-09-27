@@ -59,6 +59,9 @@ class Config(BaseModel):
     retry_count: int = Field(default=3, ge=1, le=10)
     retry_delay_seconds: float = Field(default=1.0, ge=0, le=60)
     minimum_free_disk_bytes: int = Field(default=100 * 1024 * 1024, ge=0)
+    # Whether CaptionForge looks for newer packages by itself: when the page
+    # opens, and when YouTube refuses yt-dlp. It always asks before installing.
+    check_for_updates: bool = True
 
     _field_names: ClassVar[frozenset[str]] = frozenset(
         {
@@ -102,6 +105,7 @@ class Config(BaseModel):
             "retry_count",
             "retry_delay_seconds",
             "minimum_free_disk_bytes",
+            "check_for_updates",
         }
     )
 

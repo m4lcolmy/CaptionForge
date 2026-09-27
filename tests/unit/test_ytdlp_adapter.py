@@ -83,6 +83,12 @@ def test_missing_optional_metadata_is_safe(
     [
         ("ERROR: Private video", PrivateVideoError),
         ("ERROR: Video unavailable", VideoUnavailableError),
+        # yt-dlp's wording for an ID that names no video; it used to fall
+        # through to "check your internet connection" and be retried.
+        (
+            "ERROR: [youtube] xxxxxxxxxxx: This video is unavailable",
+            VideoUnavailableError,
+        ),
         ("ERROR: extractor failed", MetadataRetrievalError),
     ],
 )

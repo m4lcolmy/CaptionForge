@@ -23,8 +23,10 @@ quality, or its audio as MP3. This is the only path that fetches a video
 stream, it happens only when explicitly asked for, and it is kept in its own
 service so no caption or transcription path can reach it by accident.
 
-There is no network call to any service other than YouTube (via `yt-dlp`) and
-the Whisper model host on first model download.
+There is no network call to any service other than YouTube (via `yt-dlp`), the
+Whisper model host on first model download, and PyPI when CaptionForge checks
+for newer releases of its own packages (section 11). It installs none of them
+without asking.
 
 ---
 
@@ -34,6 +36,8 @@ the Whisper model host on first model download.
 app/
 ├── main.py              entry point → app.interfaces.cli:app  (console script "captionforge")
 ├── interfaces/cli.py    Typer commands, Rich rendering, error→exit-code mapping
+├── interfaces/desktop.py   one instance, one window, and a lifetime for the web app
+├── interfaces/launcher.py  writes the applications-menu entry that starts it
 ├── services/            orchestration; the only place where a workflow is decided
 │   ├── video_service.py         URL validation + live/availability guards + discovery
 │   ├── subtitle_service.py      track selection, caption parsing, minimal cleanup
@@ -100,6 +104,7 @@ Validated constraints that matter in practice:
 | `default_output_formats` | comma string or tuple; must be non-empty and a subset of srt/vtt/txt/json/docx |
 | `whisper_language`, `whisper_model_download_directory` | blank string is coerced to `None` (unset) |
 | `retry_count` | 1–10 |
+| `check_for_updates` | `true` (default) looks for updates when the page opens and when YouTube refuses yt-dlp; `false` looks only on `captionforge update`. Installing always asks. |
 
 ---
 
@@ -116,11 +121,42 @@ Validated constraints that matter in practice:
 | `prepare-audio` | metadata + audio | WAV only | `AudioService.prepare` |
 | `download` | metadata + **video and/or audio stream** | yes | `MediaService.download` |
 | `clean` | none | yes | local file → parse → post-process → export |
+| `web` | whatever the page asks for | yes | FastAPI app on `127.0.0.1` |
+| `desktop` | whatever the page asks for | yes | the same app, in a window |
+| `install-desktop` | no | one desktop entry and one icon | `interfaces/launcher.py` |
+| `update` | PyPI | the packages you pick | `PackageUpdater.check` → ask → `install` |
 
 Every command runs through `_run_with_config`, which does the same four things:
 load config, configure logging, run the action, and translate exceptions into a
-short user-facing message plus an exit code. Raw `yt-dlp`, FFmpeg, CUDA or
+short user-facing message plus an exit code. When the action fails with
+`ExtractorRefusedError` and someone is at the terminal, it first offers a newer
+yt-dlp and, if one was installed, runs the action once more. Raw `yt-dlp`, FFmpeg, CUDA or
 Python text never reaches stdout/stderr — it goes to the log file.
+
+### Desktop mode
+
+`captionforge desktop` ([app/interfaces/desktop.py](../app/interfaces/desktop.py))
+serves exactly what `web` serves — same `create_app`, same token, same page. It
+adds only the three behaviours an application needs and a served page does not:
+
+1. **One instance.** The port and token are recorded in
+   `$XDG_RUNTIME_DIR/captionforge-desktop-<uid>.json`. A second launch probes
+   that server's `/api/health`; if it answers, the second launch opens its URL
+   and exits. A record left behind by a crash fails the probe and is deleted.
+2. **A window, best-effort.** `pywebview` if it is installed, otherwise a
+   Chromium-family browser started with `--app=<url>` (a window with no tab
+   strip or address bar), otherwise `webbrowser.open`. Only the first blocks, so
+   the other two wait on the server thread instead.
+3. **A lifetime.** `ActivityMiddleware` timestamps every request; the page pings
+   `/api/health` every 20 s. After `IDLE_GRACE_SECONDS` (90 s) with no request
+   the watchdog sets `server.should_exit` — unless `JobRegistry` still holds an
+   unfinished job, in which case the timer is reset and the work finishes first.
+   `SIGTERM` (logout) takes the same graceful path.
+
+`install-desktop` ([app/interfaces/launcher.py](../app/interfaces/launcher.py))
+writes an entry that runs `<sys.executable> -m app desktop` with `Path=` set to
+the folder the install ran in, which is what keeps the relative
+`default_output_folder`, `temp/`, and `logs/` pointing where the CLI puts them.
 
 ### Exit codes
 
@@ -523,6 +559,46 @@ fixed, not exponential.
 Note that `UnsupportedModelError` inherits `retryable = True` from
 `ModelLoadError`, so a genuinely bad model name is retried `retry_count` times
 before failing.
+
+**Outdated yt-dlp.** YouTube changes its site every few weeks and then refuses
+older yt-dlp releases: HTTP 403, "Sign in to confirm you're not a bot", "nsig
+extraction failed", "Unable to extract", or every format vanishing ("Requested
+format is not available" during inspection). Retrying never fixes that, so those
+errors are marked `ExtractorRefusedError` (`MetadataRefusedError`,
+`SubtitleStreamForbiddenError`, `AudioStreamForbiddenError`,
+`MediaStreamForbiddenError`) instead of being retried.
+
+The adapter only reports a refusal. Deciding what to do is the interface's job,
+and both interfaces ask before installing anything:
+
+- **Terminal.** `_run_with_config` catches the refusal. If `check_for_updates`
+  is on, pip exists, and stdin and stdout are a TTY, it runs a fresh check and
+  lists every available update. yt-dlp comes first and defaults to yes; the
+  rest default to no. If yt-dlp was installed, the command runs once more. From
+  a script, it prints "Run 'captionforge update'" instead of asking.
+- **Page.** `/api/inspect` errors and failed job snapshots carry
+  `update_may_help`. The page then asks `/api/updates?fresh=1` and shows the
+  updates row with yt-dlp ticked. Nothing installs until "Update selected"
+  posts the ticked names to `/api/updates`.
+
+**Updates.** `PackageUpdater` ([app/adapters/package_updater.py](../app/adapters/package_updater.py))
+owns a fixed list, `PACKAGES`: CaptionForge's direct dependencies, each with
+its version range from `pyproject.toml` (a test keeps them identical) and a
+one-line *mission* shown next to it wherever it is offered.
+
+- `check()` runs `pip install --upgrade --dry-run --report -` over the installed
+  ones, so pip's own index settings and resolver decide what is newer. Nothing
+  is installed. The answer is reused for six hours unless a fresh one is asked
+  for. The page asks on arrival; a refusal and `captionforge update` ask fresh.
+- `install(names)` accepts only names from `PACKAGES`, never what a request
+  sent, and upgrades exactly those.
+- A new yt-dlp is loaded in place: every `yt_dlp` module is dropped from
+  `sys.modules` and imported again, so an open page uses it at once. That is
+  why the adapter looks up `yt_dlp.YoutubeDL` and `DownloadError` on every call.
+  Other packages report `restart_needed` when they were already imported.
+- One updater per process (`UPDATER`), with one lock, so a check and an install
+  never run pip at the same time.
+- Without pip (or in a bundled executable) nothing runs; `doctor` says so.
 
 **Logging.** `configure_logging` removes Loguru's default handler and adds a
 **file sink only** — `logs/captionforge_YYYY-MM-DD.log`, rotating at 10 MB,
