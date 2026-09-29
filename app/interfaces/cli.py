@@ -727,35 +727,16 @@ def web(
 
 
 @app.command()
-def desktop(
-    port: int = typer.Option(
-        0, "--port", help="Port to bind on 127.0.0.1; 0 chooses a free one."
-    ),
-    window: bool = typer.Option(
-        True,
-        "--window/--browser",
-        help="Open a window of its own, or a tab in your usual browser.",
-    ),
-) -> None:
-    """Open CaptionForge as a desktop app, with no terminal to keep open."""
+def desktop() -> None:
+    """Open CaptionForge in a window of its own, with no terminal to keep open."""
 
     def run(config: Config) -> None:
         from app.interfaces.desktop import launch
 
-        def announce(url: str, joined: bool) -> None:
-            opening = "Opening the CaptionForge already running at"
+        if launch(config):
             console.print(
-                Panel(
-                    f"[bold green]{url}[/bold green]\n\n"
-                    "Everything runs on this computer. Close the window to "
-                    "stop it;\nunfinished downloads and transcriptions still "
-                    "finish first.",
-                    title=opening if joined else f"{APP_NAME} is open",
-                    border_style="green",
-                )
+                f"{APP_NAME} is already open; its window has been brought forward."
             )
-
-        launch(config, port=port, window=window, announce=announce)
 
     _run_with_config(run)
 

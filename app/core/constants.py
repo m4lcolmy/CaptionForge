@@ -3,7 +3,7 @@
 from typing import Final
 
 APP_NAME: Final[str] = "CaptionForge"
-VERSION: Final[str] = "0.7.0"
+VERSION: Final[str] = "0.8.0"
 ENV_PREFIX: Final[str] = "CAPTIONFORGE_"
 ENV_FILE: Final[str] = ".env"
 LOG_FILE_NAME: Final[str] = "captionforge_{time:YYYY-MM-DD}.log"

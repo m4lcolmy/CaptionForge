@@ -264,7 +264,12 @@ def test_the_list_mirrors_the_versions_in_pyproject() -> None:
         package_updater._normalize(r.split(">")[0].split("<")[0]): r for r in declared
     }
 
-    listed = {package.name: package.name + package.requirement for package in PACKAGES}
+    # Names are compared the way pip compares them: PySide6-Essentials is
+    # spelled with capitals in both places, but it need not be.
+    listed = {
+        package_updater._normalize(package.name): package.name + package.requirement
+        for package in PACKAGES
+    }
 
     assert set(listed) == set(specs)
     for name, requirement in listed.items():

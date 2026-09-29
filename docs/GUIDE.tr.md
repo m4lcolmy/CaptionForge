@@ -1,7 +1,7 @@
 # CaptionForge — Uygulama Nasıl Çalışır
 
 Uygulamanın iç işleyişine dair çalışan bir rehber: hangi katman ne yapıyor, her
-komutta ne oluyor ve çıktıyı hangi kurallar belirliyor. Sürüm 0.7.0, Python
+komutta ne oluyor ve çıktıyı hangi kurallar belirliyor. Sürüm 0.8.0, Python
 3.12+.
 
 ---
@@ -31,7 +31,7 @@ paketlerin hiçbiri sorulmadan kurulmaz.
 app/
 ├── main.py              giriş noktası → app.interfaces.cli:app  ("captionforge" konsol betiği)
 ├── interfaces/cli.py    Typer komutları, Rich çıktısı, hata→çıkış kodu eşlemesi
-├── interfaces/desktop.py   web uygulamasına tek örnek, bir pencere ve bir ömür ekler
+├── interfaces/desktop/  Qt penceresi: sayfanın bölümleri, yerel bileşenler olarak
 ├── interfaces/launcher.py  uygulamayı başlatan menü girdisini yazar
 ├── services/            orkestrasyon; iş akışının kararlaştırıldığı tek yer
 │   ├── video_service.py         URL doğrulama + canlı/erişilebilirlik kontrolleri + keşif
@@ -116,7 +116,7 @@ Pratikte önem taşıyan doğrulama kuralları:
 | `prepare-audio` | meta veri + ses | yalnızca WAV | `AudioService.prepare` |
 | `clean` | yok | evet | yerel dosya → ayrıştır → son işleme → dışa aktar |
 | `web` | sayfanın istediği kadar | evet | `127.0.0.1` üzerinde FastAPI |
-| `desktop` | sayfanın istediği kadar | evet | aynı uygulama, bir pencerede |
+| `desktop` | pencerenin istediği kadar | evet | aynı servisler üzerinde bir Qt penceresi |
 | `install-desktop` | hayır | bir masaüstü girdisi ve bir simge | `interfaces/launcher.py` |
 | `update` | PyPI | seçtiğiniz paketler | `PackageUpdater.check` → sor → `install` |
 
@@ -129,29 +129,50 @@ Python metni asla stdout/stderr'e ulaşmaz — log dosyasına gider.
 
 ### Masaüstü kipi
 
-`captionforge desktop` ([app/interfaces/desktop.py](../app/interfaces/desktop.py))
-tam olarak `web`'in sunduğunu sunar — aynı `create_app`, aynı token, aynı sayfa.
-Yalnızca bir uygulamanın ihtiyaç duyduğu, sunulan bir sayfanın duymadığı üç
-davranışı ekler:
+`captionforge desktop` ([app/interfaces/desktop/](../app/interfaces/desktop/))
+web sunucusunun çağırdığı servisleri aynı süreç içinde çağıran bir Qt (PySide6)
+penceresi açar: arama için `create_video_service().inspect_all`, altyazı ve
+indirmeler için `JobRegistry`, güncellemeler için `PackageUpdater` ve web
+tercihleri dosyası; böylece iki arayüz de aynı seçimleri hatırlar. Arada HTTP
+sunucusu, port ya da token yoktur.
 
-1. **Tek örnek.** Port ve token
-   `$XDG_RUNTIME_DIR/captionforge-desktop-<uid>.json` dosyasına yazılır. İkinci
-   çalıştırma o sunucunun `/api/health` adresini yoklar; yanıt gelirse yalnızca
-   onun adresini açar ve çıkar. Çökmeden kalan kayıt yoklamada elenir ve silinir.
-2. **Elden geldiğince pencere.** Kuruluysa `pywebview`, değilse `--app=<url>` ile
-   başlatılan Chromium ailesinden bir tarayıcı (sekme şeridi ve adres çubuğu
-   olmayan bir pencere), o da yoksa `webbrowser.open`. Yalnızca ilki bloklar;
-   diğer ikisinde sunucu iş parçacığı beklenir.
-3. **Bir ömür.** `ActivityMiddleware` her isteği zaman damgalar; sayfa her 20
-   saniyede bir `/api/health` yoklar. `IDLE_GRACE_SECONDS` (90 sn) boyunca hiç
-   istek gelmezse gözcü `server.should_exit` bayrağını kaldırır — `JobRegistry`
-   içinde bitmemiş bir iş varsa süre sıfırlanır ve önce iş tamamlanır. `SIGTERM`
-   (oturum kapatma) da aynı düzgün yoldan gider.
+- `theme.py`, `app.css`'i yeniden ifade eder: açık ve koyu için aynı
+  değişkenler, Qt stil sayfası olarak aynı kurallar; sistem renk şemasını
+  değiştirdiğinde anında geçiş yapar. Qt stil sayfalarının ifade edemediklerini
+  (`letter-spacing`, büyük harf, `opacity`, `:has()`, 1.55 satır yüksekliği)
+  bileşenler kendileri yapar.
+- `widgets.py` sayfanın görsel sözlüğüdür: çipler, seçenek kartları, ilerleme
+  çubuğu, dosya satırları, Options açılır bölümü.
+- `window.py` bölümleri sayfadaki sırayla kurar ve `app.js`'i izler: işi her
+  700 ms'de bir yoklar, son değişiklikten 600 ms sonra seçimleri kaydeder,
+  YouTube reddettiğinde daha yeni bir yt-dlp önerir. Yavaş çağrılar ayrı bir iş
+  parçacığında çalışır ve sonucu pencerenin iş parçacığına iletir
+  (`background.py`).
+- `application.py` sürecin kendisini yönetir:
+
+1. **Tek örnek.** `$XDG_RUNTIME_DIR` içindeki bir `QLockFile` hangi kopyanın
+   ilk olduğunu belirler; ilk kopya yanındaki, yalnızca kullanıcının
+   erişebildiği yerel bir soketi dinler. Sonraki bir çalıştırma bu sokete
+   seslenir, açık pencere öne gelir ve sonraki çalıştırma çıkar. Kilit sahibinin
+   PID'ine bağlıdır; bu yüzden bir çökme bir sonraki açılışı asla engellemez.
+2. **Masaüstüne göre adlandırılmış.** `QApplication`, argv[0] `captionforge`
+   olarak başlatılır; X11 bunu WM_CLASS örnek adı olarak kullanır.
+   `desktopFileName` de `captionforge`'dur, yani Wayland uygulama kimliği.
+   Girdideki `StartupWMClass=captionforge` sayesinde GNOME pencereyi
+   CaptionForge simgesinin altında gösterir.
+3. **Bir ömür.** `JobRegistry` içinde bitmemiş iş varken pencereyi kapatmak onu
+   yalnızca gizler; uygulama son iş bittiğinde sona erer. `SIGTERM` (oturum
+   kapatma) ve terminaldeki Ctrl+C onu hemen sonlandırır.
+
+Komut satırı yalnızca Qt'yi içe aktarmayan `app/interfaces/desktop/__init__.py`
+dosyasını yükler; böylece `[desktop]` eki kurulu olmadan da geri kalan her şey
+çalışır.
 
 `install-desktop` ([app/interfaces/launcher.py](../app/interfaces/launcher.py))
 `<sys.executable> -m app desktop` çalıştıran bir girdi yazar ve `Path=` alanını
 kurulumun yapıldığı klasöre ayarlar; göreli `default_output_folder`, `temp/` ve
 `logs/` yollarının komut satırındakiyle aynı yere düşmesini sağlayan budur.
+Girdi ayrıca `StartupWMClass=captionforge` ve `SingleMainWindow=true` bildirir.
 
 ### Çıkış kodları
 

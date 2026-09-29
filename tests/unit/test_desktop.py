@@ -1,225 +1,719 @@
-"""Offline tests for desktop mode and the desktop entry it installs."""
+"""Offline tests for the Qt desktop window and the desktop entry it installs.
 
-import json
+The window runs on Qt's offscreen platform, so these need no display. Its
+services and job registry are stand-ins: nothing here reaches YouTube, pip or
+a Whisper model.
+"""
+
+import builtins
+import os
 import platform
-import threading
+import subprocess
+import sys
 import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from app.core.config import Config
-from app.interfaces import desktop, launcher
-from app.models.job import JobStatus
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+pytest.importorskip("PySide6.QtWidgets")
+
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QRect, Qt  # noqa: E402
+from PySide6.QtGui import QColor, QImage, QPalette  # noqa: E402
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+from app.adapters.package_updater import (  # noqa: E402
+    PACKAGES,
+    AvailableUpdate,
+    InstalledUpdate,
+)
+from app.adapters.whisper_adapter import CudaStatus  # noqa: E402
+from app.core.config import Config  # noqa: E402
+from app.core.exceptions import (  # noqa: E402
+    ConfigurationError,
+    ExtractorRefusedError,
+)
+from app.interfaces import cli, desktop, launcher  # noqa: E402
+from app.interfaces.desktop import application as desktop_app  # noqa: E402
+from app.interfaces.desktop import theme  # noqa: E402
+from app.interfaces.desktop.widgets import Chip, FileRow  # noqa: E402
+from app.interfaces.desktop.window import (  # noqa: E402
+    MainWindow,
+    Services,
+    format_duration,
+    format_size,
+)
+from app.interfaces.web.jobs import (  # noqa: E402
+    JobRecord,
+    JobRequest,
+    MediaJobRequest,
+    OutputFile,
+)
+from app.models.job import JobStatus  # noqa: E402
+from app.models.media import MediaKind, MediaOptions, MediaVariant  # noqa: E402
+from app.models.subtitle import (  # noqa: E402
+    SubtitleDiscoveryResult,
+    SubtitleSourceType,
+    SubtitleTrack,
+)
+from app.models.video import VideoMetadata  # noqa: E402
+from app.services.video_service import VideoInspection  # noqa: E402
+
+URL = "https://youtu.be/qJFbKl6RjLU"
+YTDLP = next(package for package in PACKAGES if package.name == "yt-dlp")
 
 
-class StubRecord:
-    """A job record with only the field the watchdog reads."""
-
-    def __init__(self, status: JobStatus) -> None:
-        self.status = status
+# ---------- stand-ins ----------
 
 
 class StubRegistry:
-    """A registry that reports a fixed set of jobs."""
-
-    def __init__(self, *statuses: JobStatus) -> None:
-        self._records = [StubRecord(status) for status in statuses]
-
-    def recent(self) -> list[StubRecord]:
-        """Return the fixed jobs, newest first like the real registry."""
-        return self._records
-
-
-class StubServer:
-    """A uvicorn server stand-in that only records the stop request."""
+    """A job registry that records requests and never runs anything."""
 
     def __init__(self) -> None:
-        self.should_exit = False
+        self.records: dict[str, JobRecord] = {}
+        self.submitted: list[JobRequest | MediaJobRequest] = []
+        self.stopped = False
+
+    def _add(self, request: JobRequest | MediaJobRequest) -> JobRecord:
+        record = JobRecord(id=f"job-{len(self.records) + 1}", request=request)
+        self.records[record.id] = record
+        self.submitted.append(request)
+        return record
+
+    def submit(self, request: JobRequest) -> JobRecord:
+        return self._add(request)
+
+    def submit_media(self, request: MediaJobRequest) -> JobRecord:
+        return self._add(request)
+
+    def get(self, job_id: str) -> JobRecord | None:
+        return self.records.get(job_id)
+
+    def recent(self) -> list[JobRecord]:
+        return list(reversed(self.records.values()))
+
+    def cancel(self, job_id: str) -> bool:
+        record = self.records.get(job_id)
+        if record is None:
+            return False
+        record.cancel_event.set()
+        return True
+
+    def shutdown(self) -> None:
+        self.stopped = True
 
 
-def test_activity_starts_fresh_and_ages() -> None:
-    """Idle time grows from the moment the server starts, not from first use."""
-    activity = desktop.Activity()
+class StubUpdater:
+    """An updater with a fixed answer, which installs whatever it is told."""
 
-    assert activity.idle_seconds() < 1.0
+    def __init__(self, *updates: AvailableUpdate) -> None:
+        self.updates = updates
+        self.installed: list[list[str]] = []
+        self.fresh: list[bool] = []
 
-    activity._last -= 30.0
-    assert activity.idle_seconds() >= 30.0
+    def can_update(self) -> bool:
+        return True
 
+    def check(self, *, fresh: bool = False) -> tuple[AvailableUpdate, ...]:
+        self.fresh.append(fresh)
+        return self.updates
 
-def test_busy_covers_every_unfinished_stage() -> None:
-    """Any stage between queued and exporting counts as work in progress."""
-    assert desktop.busy(StubRegistry(JobStatus.TRANSCRIBING))
-    assert desktop.busy(StubRegistry(JobStatus.COMPLETED, JobStatus.PENDING))
-    assert not desktop.busy(StubRegistry(JobStatus.COMPLETED, JobStatus.FAILED))
-    assert not desktop.busy(StubRegistry())
-
-
-def test_watchdog_stops_an_unused_server(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With no page asking for anything, the server stops on its own."""
-    monkeypatch.setattr(desktop, "WATCHDOG_INTERVAL_SECONDS", 0.01)
-    monkeypatch.setattr(desktop, "IDLE_GRACE_SECONDS", 0.02)
-    server = StubServer()
-
-    desktop.watch_for_idle(server, desktop.Activity(), StubRegistry())
-
-    assert server.should_exit is True
+    def install(self, names: list[str]) -> tuple[InstalledUpdate, ...]:
+        self.installed.append(list(names))
+        return tuple(
+            InstalledUpdate(update.name, update.latest, False)
+            for update in self.updates
+            if update.name in names
+        )
 
 
-def test_watchdog_waits_for_a_running_job(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Closing the window never abandons a transcription that is still running."""
-    monkeypatch.setattr(desktop, "WATCHDOG_INTERVAL_SECONDS", 0.01)
-    monkeypatch.setattr(desktop, "IDLE_GRACE_SECONDS", 0.02)
-    server = StubServer()
-    registry = StubRegistry(JobStatus.TRANSCRIBING)
-
-    watching = threading.Thread(
-        target=desktop.watch_for_idle, args=(server, desktop.Activity(), registry)
-    )
-    watching.start()
-    time.sleep(0.2)
-    running = not server.should_exit
-    server.should_exit = True
-    watching.join(timeout=2)
-
-    assert running is True
-
-
-def test_session_file_is_recorded_and_cleared(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A launch records where it listens so the next one joins it."""
-    monkeypatch.setattr(desktop, "session_file", lambda: tmp_path / "session.json")
-    session = desktop.Session("127.0.0.1", 8123, "token-value")
-
-    desktop.write_session(session)
-    recorded = json.loads((tmp_path / "session.json").read_text("utf-8"))
-
-    assert recorded == {"host": "127.0.0.1", "port": 8123, "token": "token-value"}
-
-    desktop.clear_session(session)
-    assert not (tmp_path / "session.json").exists()
-
-
-def test_a_second_instance_keeps_the_first_ones_record(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A duplicate that exits must not erase the server still running."""
-    monkeypatch.setattr(desktop, "session_file", lambda: tmp_path / "session.json")
-    desktop.write_session(desktop.Session("127.0.0.1", 8123, "first"))
-
-    desktop.clear_session(desktop.Session("127.0.0.1", 9999, "second"))
-
-    assert (tmp_path / "session.json").exists()
-
-
-def test_a_dead_record_is_not_reused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A record left behind by a crash is discarded, not opened."""
-    monkeypatch.setattr(desktop, "session_file", lambda: tmp_path / "session.json")
-    monkeypatch.setattr(desktop, "answers", lambda session: False)
-    desktop.write_session(desktop.Session("127.0.0.1", 8123, "stale"))
-
-    assert desktop.running_session() is None
-    assert not (tmp_path / "session.json").exists()
-
-
-def test_the_desktop_app_serves_the_same_page_and_stops_by_itself(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A real launch answers on localhost, then shuts down once nobody asks."""
-    fastapi = pytest.importorskip("fastapi")
-    pytest.importorskip("uvicorn")
-    assert fastapi is not None
-
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(desktop, "session_file", lambda: tmp_path / "session.json")
-    monkeypatch.setattr(desktop, "WATCHDOG_INTERVAL_SECONDS", 0.05)
-    monkeypatch.setattr(desktop, "IDLE_GRACE_SECONDS", 0.5)
-    opened: list[str] = []
-
-    launched = threading.Thread(
-        target=desktop.launch,
-        args=(Config(),),
-        kwargs={"open_page": False, "announce": lambda url, joined: opened.append(url)},
-        daemon=True,
-    )
-    launched.start()
-
-    deadline = time.monotonic() + 20
-    while not opened and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert opened, "the desktop app never reported a URL"
-
-    session = desktop.running_session()
-    assert session is not None
-    assert session.url == opened[0]
-
-    launched.join(timeout=20)
-    assert not launched.is_alive()
-    assert not (tmp_path / "session.json").exists()
-
-
-def test_open_browser_prefers_a_window_over_a_tab(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A Chromium-family browser opens the page as its own window."""
-    calls: list[list[str]] = []
-    monkeypatch.setattr(desktop, "app_mode_browser", lambda: "/usr/bin/chromium")
-    monkeypatch.setattr(
-        desktop, "primary_screen", lambda: desktop.Geometry(0, 0, 1920, 1080)
-    )
-    monkeypatch.setattr(
-        desktop.subprocess, "Popen", lambda command, **kwargs: calls.append(command)
+def track(code: str, *, automatic: bool = False, translated: bool = False) -> Any:
+    """A caption track with only the fields the window reads."""
+    return SubtitleTrack(
+        language_code=code,
+        normalized_language_code=code,
+        source_type=(
+            SubtitleSourceType.AUTOMATIC if automatic else SubtitleSourceType.MANUAL
+        ),
+        is_automatic=automatic,
+        is_translated=translated,
     )
 
-    described = desktop.open_browser("http://127.0.0.1:1/?t=x", app_mode=True)
 
-    assert described == "chromium window"
-    assert calls[0][1] == "--app=http://127.0.0.1:1/?t=x"
-    assert f"--window-size={desktop.WINDOW_WIDTH},{desktop.WINDOW_HEIGHT}" in calls[0]
-    assert "--window-position=510,140" in calls[0]
-    # Its own profile, or an already open browser would ignore the size.
-    assert any(flag.startswith("--user-data-dir=") for flag in calls[0])
-
-
-def test_window_is_centred_on_the_primary_monitor() -> None:
-    """The window lands in the middle of the main screen, not a side monitor."""
-    output = (
-        "HDMI-1 connected 2560x1440+1920+0 (normal) 600mm x 340mm\n"
-        "eDP-1 connected primary 1920x1080+0+0 (normal) 344mm x 193mm\n"
-        "DP-2 disconnected (normal left inverted right x axis y axis)\n"
+def inspection(title: str = "How captions are made") -> VideoInspection:
+    """A video with two real tracks, two translations, and three downloads."""
+    video = VideoMetadata(
+        video_id="qJFbKl6RjLU",
+        title=title,
+        channel_name="Example Channel",
+        duration_seconds=3725,
+        webpage_url=URL,
+        original_url=URL,
+        thumbnail_url="https://i.ytimg.com/vi/qJFbKl6RjLU/hqdefault.jpg",
     )
+    selected = track("ar")
+    discovery = SubtitleDiscoveryResult(
+        video=video,
+        manual_tracks=(selected,),
+        automatic_tracks=(
+            track("ar", automatic=True),
+            track("fr", automatic=True, translated=True),
+            track("de", automatic=True, translated=True),
+        ),
+        selected_track=selected,
+        preferred_language="ar",
+        selection_reason="manual track in the preferred language",
+    )
+    media = MediaOptions(
+        variants=(
+            MediaVariant(
+                key="720",
+                kind=MediaKind.VIDEO,
+                label="720p",
+                extension="mp4",
+                height=720,
+                estimated_bytes=50 * 1024 * 1024,
+            ),
+            MediaVariant(
+                key="audio",
+                kind=MediaKind.AUDIO,
+                label="MP3",
+                extension="mp3",
+                estimated_bytes=8_500_000,
+            ),
+        )
+    )
+    return VideoInspection(discovery=discovery, media=media)
 
-    screen = desktop.parse_xrandr(output)
 
-    assert screen == desktop.Geometry(0, 0, 1920, 1080)
-    assert desktop.window_geometry(screen) == desktop.Geometry(510, 140, 900, 800)
+def png_bytes() -> bytes:
+    """A real picture, so the thumbnail has something to decode."""
+    image = QImage(32, 18, QImage.Format.Format_RGB32)
+    image.fill(QColor("#00D68F"))
+    data = QByteArray()
+    buffer = QBuffer(data)
+    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    image.save(buffer, "PNG")
+    return bytes(data.data())
+
+
+def wait_until(condition: Callable[[], object], timeout: float = 5.0) -> None:
+    """Let Qt deliver queued work until ``condition`` holds."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        QApplication.processEvents()
+        if condition():
+            return
+        time.sleep(0.01)
+    raise AssertionError("the window never got there")
+
+
+def finish(record: JobRecord, *files: Path, **fields: Any) -> None:
+    """Move a stub job to completed, as the registry's worker would."""
+    with record.lock:
+        record.files = [
+            OutputFile(path.name, path, path.stat().st_size) for path in files
+        ]
+        for name, value in fields.items():
+            setattr(record, name, value)
+        record.status = JobStatus.COMPLETED
+        record.stage = "Completed"
+        record.percent = 100.0
+
+
+# ---------- fixtures ----------
+
+
+@pytest.fixture(scope="session")
+def qt_app() -> QApplication:
+    """One styled application for every test, as a real session has."""
+    created = desktop_app.application()
+    theme.theme().install(created)
+    theme.theme().apply(theme.LIGHT)
+    return created
+
+
+@pytest.fixture
+def make_window(
+    qt_app: QApplication, tmp_path: Path
+) -> Iterator[Callable[..., MainWindow]]:
+    """Build windows over stand-ins, and take them down after the test."""
+    made: list[MainWindow] = []
+
+    def build(**overrides: Any) -> MainWindow:
+        opened: list[Path] = overrides.pop("opened", [])
+        services = Services(
+            inspect=overrides.pop("inspect", lambda url, language, allow: inspection()),
+            updater=overrides.pop("updater", StubUpdater()),
+            cuda=overrides.pop("cuda", lambda: CudaStatus(True, True, ())),
+            fetch=overrides.pop("fetch", lambda url: png_bytes()),
+            open_path=lambda path: opened.append(path) or True,
+        )
+        window = MainWindow(
+            overrides.pop("config", Config()),
+            registry=overrides.pop("registry", StubRegistry()),
+            services=services,
+            preferences_file=overrides.pop("preferences_file", tmp_path / "prefs.json"),
+        )
+        assert not overrides, f"unknown overrides {sorted(overrides)}"
+        window.resize(900, 800)
+        window.show()
+        made.append(window)
+        return window
+
+    yield build
+    for window in made:
+        window.shutdown()
+        window.hide()
+        window.deleteLater()
+    QApplication.processEvents()
+
+
+def looked_up(window: MainWindow, url: str = URL) -> MainWindow:
+    """Type a link and wait for the lookup to fill the window."""
+    window.url.setText(url)
+    window.look_up()
+    wait_until(lambda: not window.controls.isHidden())
+    return window
+
+
+# ---------- formatting, as the page formats ----------
+
+
+def test_sizes_and_durations_read_like_the_page() -> None:
+    assert format_size(512) == "512 B"
+    assert format_size(8_500_000) == "8.1 MB"
+    assert format_size(18_234) == "17.8 KB"
+    assert format_duration(3725) == "1:02:05"
+    assert format_duration(754) == "12:34"
+    assert format_duration(None) == ""
+
+
+# ---------- window placement ----------
+
+
+def test_window_is_centred_on_the_screen() -> None:
+    """The window lands in the middle of the main screen at its natural size."""
+    place = desktop_app.window_geometry(QRect(0, 0, 1920, 1080))
+
+    assert place == QRect(510, 140, 900, 800)
 
 
 def test_window_shrinks_to_fit_a_small_screen() -> None:
     """On a 1366x768 laptop the window still fits, with a margin all round."""
-    place = desktop.window_geometry(desktop.Geometry(0, 0, 1366, 768))
+    place = desktop_app.window_geometry(QRect(0, 0, 1366, 768))
 
-    assert (place.width, place.height) == (900, 691)
-    assert (place.x, place.y) == (233, 38)
+    assert (place.width(), place.height()) == (900, 691)
+    assert (place.x(), place.y()) == (233, 38)
 
 
-def test_open_browser_falls_back_to_the_usual_browser(
+def test_the_app_is_named_for_its_desktop_entry(qt_app: QApplication) -> None:
+    """GNOME groups the window under the entry by these names."""
+    assert qt_app.arguments()[0] == launcher.ENTRY_NAME
+    assert qt_app.desktopFileName() == launcher.ENTRY_NAME
+    assert qt_app.applicationName() == "CaptionForge"
+    assert qt_app.quitOnLastWindowClosed() is False
+
+
+# ---------- theme ----------
+
+
+def test_the_theme_follows_the_system_colour_scheme(qt_app: QApplication) -> None:
+    """Dark on a dark desktop, light otherwise, with the page's own tokens."""
+    assert theme.palette_for(Qt.ColorScheme.Dark) is theme.DARK
+    assert theme.palette_for(Qt.ColorScheme.Light) is theme.LIGHT
+    assert theme.palette_for(Qt.ColorScheme.Unknown) is theme.LIGHT
+
+    try:
+        theme.theme().apply(theme.DARK)
+        assert theme.current() is theme.DARK
+        window = qt_app.palette().color(QPalette.ColorRole.Window)
+        assert window.name().upper() == theme.DARK.bg
+        assert theme.DARK.surface in qt_app.styleSheet()
+    finally:
+        theme.theme().apply(theme.LIGHT)
+
+
+def test_the_theme_carries_the_page_tokens_verbatim() -> None:
+    """Every colour in app.css appears here unchanged, light and dark."""
+    css = (
+        Path(__file__).parents[2] / "app" / "interfaces" / "web" / "static" / "app.css"
+    ).read_text(encoding="utf-8")
+    for value in (
+        theme.LIME,
+        theme.SPRING,
+        theme.EMERALD,
+        theme.TEAL,
+        theme.ON_VIVID,
+        *vars(theme.LIGHT).values(),
+        *vars(theme.DARK).values(),
+    ):
+        if value.startswith("#"):
+            assert value in css, value
+
+
+# ---------- looking a video up ----------
+
+
+def test_a_lookup_fills_every_section(make_window: Callable[..., MainWindow]) -> None:
+    """Title, byline, picture, downloads, tracks and controls all appear."""
+    window = looked_up(make_window())
+
+    assert window.title.plain() == "How captions are made"
+    assert window.byline.plain() == "Example Channel · 1:02:05"
+    wait_until(window.thumb.has_picture)
+    media = window.media_list.chips()
+    # The MP3 first, then the videos, each with its estimated size.
+    assert [(chip.text(), chip.kind) for chip in media] == [
+        ("MP3", "~8.1 MB"),
+        ("720p", "~50.0 MB"),
+    ]
+    tracks = window.track_list.chips()
+    assert [chip.text() for chip in tracks] == ["ar", "ar", "+2 machine-translated"]
+    assert [chip.picked for chip in tracks] == [True, False, False]
+    assert window.selection.plain() == (
+        "Will export the highlighted track (manual track in the preferred language)."
+    )
+    assert window.inspect_button.isEnabled()
+    assert window.inspect_button.text() == "Look up"
+
+
+def test_translations_stay_behind_one_chip(
+    make_window: Callable[..., MainWindow],
+) -> None:
+    """The machine translations appear only when asked for."""
+    window = looked_up(make_window())
+    more = window.track_list.chips()[-1]
+
+    more.click()
+
+    shown = [chip for chip in window.track_list.chips() if not chip.isHidden()]
+    assert [chip.text() for chip in shown] == ["ar", "ar", "fr", "de"]
+    assert shown[-1].kind == "auto · translated"
+
+
+def test_an_arabic_title_reads_right_to_left(
+    make_window: Callable[..., MainWindow],
+) -> None:
+    """``<h2 dir="auto">``: the title's own script sets its direction."""
+    window = make_window(inspect=lambda *args: inspection("سورة الملك"))
+    looked_up(window)
+
+    assert 'dir="rtl"' in window.title.text()
+    assert 'dir="ltr"' in window.byline.text()
+
+
+def test_a_refused_lookup_offers_a_newer_ytdlp(
+    make_window: Callable[..., MainWindow],
+) -> None:
+    """YouTube refusing yt-dlp ticks the yt-dlp update, and installs nothing."""
+
+    def refuse(*args: object) -> VideoInspection:
+        raise ExtractorRefusedError("YouTube refused this request.")
+
+    updater = StubUpdater(AvailableUpdate(YTDLP, "2026.8.19", "2026.9.20"))
+    window = make_window(inspect=refuse, updater=updater)
+    window.url.setText(URL)
+    window.look_up()
+
+    wait_until(lambda: not window.alert.isHidden() and updater.fresh[-1:] == [True])
+    wait_until(lambda: window.ticked_updates() == ["yt-dlp"])
+    assert window.alert_title.text() == "COULD NOT READ THAT VIDEO"
+    assert window.alert_body.plain() == "YouTube refused this request."
+    assert window.video.isHidden()
+    assert window.update_button.isEnabled()
+    assert "Nothing installs until you click" in window.updates_note.plain()
+    assert updater.installed == []
+
+
+def test_an_update_installs_exactly_what_was_ticked(
+    make_window: Callable[..., MainWindow],
+) -> None:
+    """Update selected installs the ticked package and reports it."""
+    updater = StubUpdater(AvailableUpdate(YTDLP, "2026.8.19", "2026.9.20"))
+    window = make_window(updater=updater)
+    wait_until(lambda: not window.updates.isHidden())
+    assert window.ticked_updates() == []
+    assert not window.update_button.isEnabled()
+
+    window._update_boxes[0][1].setChecked(True)
+    window.update_button.click()
+
+    wait_until(lambda: window.updates_label.text() == "UPDATED")
+    assert updater.installed == [["yt-dlp"]]
+    assert window.updates_note.plain() == "Updated yt-dlp to 2026.9.20."
+    assert window.update_list.isHidden()
+
+
+# ---------- remembering choices ----------
+
+
+def test_choices_are_remembered_for_the_next_window(
+    make_window: Callable[..., MainWindow], tmp_path: Path
+) -> None:
+    """A toggled format and option come back in the next session."""
+    window = make_window()
+    txt = next(chip for chip in window.formats.chips() if chip.text() == "txt")
+    txt.click()
+    window.keep_audio.setChecked(True)
+    window.close()
+
+    saved = (tmp_path / "prefs.json").read_text(encoding="utf-8")
+    assert '"txt"' in saved
+
+    again = make_window()
+    assert {chip.text() for chip in again.formats.chips() if chip.picked} >= {"txt"}
+    assert again.keep_audio.isChecked()
+    # A changed option is worth showing on arrival.
+    assert again.options.is_open()
+
+
+def test_an_unusable_graphics_card_cannot_be_picked(
+    make_window: Callable[..., MainWindow], tmp_path: Path
+) -> None:
+    """A saved "cuda" falls back to Automatic when CUDA will not load."""
+    (tmp_path / "prefs.json").write_text('{"device": "cuda"}', encoding="utf-8")
+    window = make_window(cuda=lambda: CudaStatus(False, True, ("cuBLAS",)))
+
+    card = window.device_cards["cuda"]
+    wait_until(lambda: not card.isEnabled())
+    assert window.chosen_device() == "auto"
+    assert "cuBLAS will not load" in card.text.text()
+
+
+# ---------- running jobs ----------
+
+
+def test_one_click_on_a_quality_starts_that_download(
+    make_window: Callable[..., MainWindow], tmp_path: Path
+) -> None:
+    """The chip is the whole request, and every other action waits for it."""
+    registry = StubRegistry()
+    opened: list[Path] = []
+    window = looked_up(make_window(registry=registry, opened=opened))
+    window.url.setText("https://youtu.be/somethingElse")
+    mp3, video = window.media_list.chips()
+
+    mp3.click()
+
+    request = registry.submitted[-1]
+    assert isinstance(request, MediaJobRequest)
+    assert request.quality == "audio"
+    # The chips describe the video that was looked up.
+    assert request.url == URL
+    assert mp3.picked and not video.isEnabled() and not mp3.isEnabled()
+    assert not window.run_button.isEnabled()
+    assert not window.progress.isHidden()
+
+    produced = tmp_path / "talk.mp3"
+    produced.write_bytes(b"x" * 2048)
+    finish(
+        registry.records["job-1"],
+        produced,
+        media_summary={"key": "audio", "label": "MP3", "kind": "audio"},
+    )
+    window._poll()
+
+    assert window.progress.isHidden()
+    assert window.results_label.text() == "SAVED THE AUDIO AS MP3"
+    assert not mp3.picked and video.isEnabled()
+    rows = window.files.findChildren(FileRow)
+    assert len(rows) == 1
+    rows[0].click()
+    assert opened == [produced]
+
+
+def test_captions_finish_with_the_transcription_details(
+    make_window: Callable[..., MainWindow], tmp_path: Path
+) -> None:
+    """Get captions sends the chosen formats and reports what Whisper did."""
+    registry = StubRegistry()
+    window = looked_up(make_window(registry=registry))
+
+    window.run_button.click()
+
+    request = registry.submitted[-1]
+    assert isinstance(request, JobRequest)
+    assert request.url == URL
+    assert request.formats == ("srt",)
+    assert request.language == Config().default_language
+
+    produced = tmp_path / "talk.srt"
+    produced.write_text("1\n", encoding="utf-8")
+    finish(
+        registry.records["job-1"],
+        produced,
+        used_existing_captions=False,
+        transcription_summary={
+            "detected_language": "ar",
+            "language_probability": 0.974,
+            "model_name": "small",
+            "device": "cpu",
+            "compute_type": "int8",
+        },
+    )
+    window._poll()
+
+    assert window.results_label.text() == "TRANSCRIBED ON THIS COMPUTER"
+    note = window.results_note.text()
+    assert "small on cpu, detected ar (97% confident)" in note
+    assert "Saved to" in note
+
+
+def test_a_failed_job_says_why(make_window: Callable[..., MainWindow]) -> None:
+    registry = StubRegistry()
+    window = looked_up(make_window(registry=registry))
+    window.run_button.click()
+    record = registry.records["job-1"]
+    with record.lock:
+        record.status = JobStatus.FAILED
+        record.error = "FFmpeg is not installed."
+
+    window._poll()
+
+    assert window.alert_title.text() == "JOB FAILED"
+    assert window.alert_body.plain() == "FFmpeg is not installed."
+    assert window.run_button.isEnabled()
+
+
+def test_cancel_asks_the_job_to_stop(make_window: Callable[..., MainWindow]) -> None:
+    registry = StubRegistry()
+    window = looked_up(make_window(registry=registry))
+    window.run_button.click()
+
+    window.cancel_button.click()
+
+    assert registry.records["job-1"].cancel_event.is_set()
+    assert window.stage.text() == "Cancelling…"
+    assert not window.cancel_button.isEnabled()
+
+
+def test_a_job_needs_a_format(make_window: Callable[..., MainWindow]) -> None:
+    registry = StubRegistry()
+    window = looked_up(make_window(registry=registry))
+    for chip in window.formats.chips():
+        if chip.picked:
+            chip.click()
+
+    window.run_button.click()
+
+    assert registry.submitted == []
+    assert window.alert_title.text() == "PICK A FORMAT"
+
+
+# ---------- lifetime ----------
+
+
+def test_closing_an_idle_window_ends_the_app(
+    make_window: Callable[..., MainWindow],
+) -> None:
+    window = make_window()
+    ended: list[bool] = []
+    window.finished.connect(lambda: ended.append(True))
+
+    window.close()
+
+    assert ended == [True]
+
+
+def test_closing_never_abandons_a_running_job(
+    make_window: Callable[..., MainWindow], tmp_path: Path
+) -> None:
+    """The window hides, the job finishes, and only then does the app end."""
+    registry = StubRegistry()
+    window = looked_up(make_window(registry=registry))
+    window.run_button.click()
+    window._idle_timer.setInterval(10)
+    ended: list[bool] = []
+    window.finished.connect(lambda: ended.append(True))
+
+    window.close()
+
+    assert window.isHidden()
+    assert ended == []
+    produced = tmp_path / "talk.srt"
+    produced.write_text("1\n", encoding="utf-8")
+    finish(registry.records["job-1"], produced, used_existing_captions=True)
+    wait_until(lambda: ended == [True])
+
+
+def test_a_second_launch_brings_the_first_forward(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """The second copy wakes the first and does not run itself."""
+    address = str(tmp_path / "instance.socket")
+    first = desktop_app.SingleInstance(address, tmp_path / "instance.lock")
+    second = desktop_app.SingleInstance(address, tmp_path / "instance.lock")
+    woken: list[bool] = []
+    first.activated.connect(lambda: woken.append(True))
+    try:
+        assert first.claim() is True
+        assert second.claim() is False
+        wait_until(lambda: woken == [True])
+    finally:
+        first.release()
+
+    third = desktop_app.SingleInstance(address, tmp_path / "instance.lock")
+    try:
+        assert third.claim() is True
+    finally:
+        third.release()
+
+
+def test_a_crashed_copy_does_not_block_the_next_launch(
+    qt_app: QApplication, tmp_path: Path
+) -> None:
+    """A lock left by a process that died is taken over, not waited on."""
+    lock = tmp_path / "instance.lock"
+    script = (
+        "import os, sys\n"
+        "from PySide6.QtCore import QLockFile\n"
+        "held = QLockFile(sys.argv[1]); held.setStaleLockTime(0)\n"
+        "assert held.tryLock(0)\n"
+        "os._exit(0)\n"
+    )
+    subprocess.run([sys.executable, "-c", script, str(lock)], check=True, timeout=60)
+    assert lock.exists()
+
+    instance = desktop_app.SingleInstance(str(tmp_path / "instance.socket"), lock)
+    try:
+        assert instance.claim() is True
+    finally:
+        instance.release()
+
+
+def test_launch_explains_how_to_install_qt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without the desktop extra, the error says which package to install."""
+    real_import = builtins.__import__
+
+    def without_qt(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "app.interfaces.desktop.application":
+            raise ModuleNotFoundError("No module named 'PySide6'", name="PySide6")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_qt)
+
+    with pytest.raises(ConfigurationError, match=r"captionforge\[desktop\]"):
+        desktop.launch(Config())
+
+
+def test_the_desktop_command_says_when_it_joined(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Without such a browser, the page opens in whatever the user uses."""
-    opened: list[str] = []
-    monkeypatch.setattr(desktop, "app_mode_browser", lambda: None)
-    monkeypatch.setattr(desktop.webbrowser, "open", lambda url: opened.append(url))
+    """A second ``captionforge desktop`` from a terminal says what it did."""
+    from typer.testing import CliRunner
 
-    described = desktop.open_browser("http://127.0.0.1:1/?t=x", app_mode=True)
+    monkeypatch.setattr(desktop, "launch", lambda config: True)
 
-    assert described == "default browser"
-    assert opened == ["http://127.0.0.1:1/?t=x"]
+    result = CliRunner().invoke(cli.app, ["desktop"])
+
+    assert result.exit_code == 0
+    assert "already open" in result.stdout
+
+
+# ---------- the desktop entry ----------
 
 
 def test_desktop_entry_starts_without_a_terminal(tmp_path: Path) -> None:
@@ -233,6 +727,14 @@ def test_desktop_entry_starts_without_a_terminal(tmp_path: Path) -> None:
     assert f"Path={tmp_path}" in entry
     assert "Icon=captionforge" in entry
     assert "Name=CaptionForge" in entry
+
+
+def test_desktop_entry_matches_the_qt_window(tmp_path: Path) -> None:
+    """The dock groups the window under this entry, and keeps it to one."""
+    entry = launcher.desktop_entry(tmp_path, ("/opt/venv/bin/python", "-m", "app"))
+
+    assert f"StartupWMClass={launcher.ENTRY_NAME}" in entry.splitlines()
+    assert "SingleMainWindow=true" in entry.splitlines()
 
 
 def test_desktop_entry_quotes_a_path_with_spaces(tmp_path: Path) -> None:
@@ -284,19 +786,11 @@ def test_uninstall_reports_nothing_when_no_entry_exists(
     assert launcher.uninstall() == ()
 
 
-def test_launch_joins_a_server_that_is_already_running(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A second click opens the running app instead of starting a second one."""
-    session = desktop.Session("127.0.0.1", 8123, "token")
-    shown: list[str] = []
-    monkeypatch.setattr(desktop, "running_session", lambda: session)
-    monkeypatch.setattr(
-        desktop, "present", lambda url, **kwargs: shown.append(url) or "window"
-    )
-    joined: list[Any] = []
+def test_chips_measure_bold_so_picking_never_reflows(qt_app: QApplication) -> None:
+    """A chip keeps its width whether or not it is picked."""
+    chip = Chip("1080p", "~173.6 MB")
+    before = chip.sizeHint()
 
-    desktop.launch(Config(), announce=lambda url, was_joined: joined.append(was_joined))
+    chip.set_picked(True)
 
-    assert shown == [session.url]
-    assert joined == [True]
+    assert chip.sizeHint() == before

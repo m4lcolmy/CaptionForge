@@ -7,6 +7,7 @@ import gc
 import importlib
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,28 @@ _BUNDLED_CUDA_LIBRARIES = (
     "libcudnn.so.*",
 )
 _cuda_preload_done = False
+
+
+@dataclass(frozen=True)
+class CudaStatus:
+    """Whether transcription can use the graphics card, and why not if it cannot.
+
+    "No GPU" and "a GPU whose libraries will not load" need different advice,
+    so both interfaces that offer the Graphics card choice ask for all three.
+    """
+
+    available: bool
+    device_present: bool
+    missing_libraries: tuple[str, ...]
+
+    @classmethod
+    def probe(cls) -> CudaStatus:
+        """Look at this computer now."""
+        return cls(
+            available=WhisperAdapter().cuda_available(),
+            device_present=WhisperAdapter.cuda_device_present(),
+            missing_libraries=WhisperAdapter.missing_cuda_libraries(),
+        )
 
 
 class WhisperAdapter:

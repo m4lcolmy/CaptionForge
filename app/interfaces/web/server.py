@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.adapters import package_updater
-from app.adapters.whisper_adapter import WhisperAdapter
+from app.adapters.whisper_adapter import CudaStatus
 from app.core.config import Config
 from app.core.constants import APP_NAME, SUPPORTED_OUTPUT_FORMATS, VERSION
 from app.core.exceptions import CaptionForgeError
@@ -223,12 +223,11 @@ def create_app(
 
 def _cuda_status() -> dict[str, object]:
     """Separate "no GPU" from "GPU present but its libraries will not load"."""
-    adapter = WhisperAdapter()
-    missing = WhisperAdapter.missing_cuda_libraries()
+    status = CudaStatus.probe()
     return {
-        "cuda_available": adapter.cuda_available(),
-        "cuda_device_present": WhisperAdapter.cuda_device_present(),
-        "cuda_missing_libraries": list(missing),
+        "cuda_available": status.available,
+        "cuda_device_present": status.device_present,
+        "cuda_missing_libraries": list(status.missing_libraries),
     }
 
 

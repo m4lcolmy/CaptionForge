@@ -48,8 +48,8 @@ python -m pip install -e ".[transcription]"
 python -m pip install -e ".[web]"
 ```
 
-The desktop app needs nothing beyond `[web]`. A native window instead of a
-browser one is optional:
+The desktop app is a native Qt window. It needs only its own extra, not the
+web packages:
 
 ```bash
 python -m pip install -e ".[desktop]"
@@ -103,8 +103,10 @@ captionforge install-desktop
 ```
 
 Search your applications for **CaptionForge** and start it like any other app.
-It opens in a window of its own, serving the same page `captionforge web`
-serves. Nothing has to stay open behind it.
+It opens a native window, drawn with Qt, that looks and works like the page
+`captionforge web` serves: the same sections, the same wording, the same green
+ramp, light or dark with your system. There is no server behind it, no port,
+and no browser; the window calls CaptionForge directly.
 
 The entry runs `captionforge desktop` from the folder you were in when you
 installed it, so output, `temp/`, and `logs/` land exactly where they land when
@@ -119,27 +121,29 @@ captionforge install-desktop --remove
 You can also start the app without installing anything:
 
 ```bash
-captionforge desktop            # a window of its own
-captionforge desktop --browser  # a tab in your usual browser
+captionforge desktop
 ```
 
-What the window is depends on what you have, in this order: a native window if
-[`pywebview`](https://pywebview.flowrl.com/) is installed, otherwise a
-chromeless window from a Chromium-family browser (Chrome, Chromium, Brave,
-Edge, Vivaldi), otherwise a normal tab in your default browser.
+A few things differ from the page, because an application can do better:
 
-Three things make it behave like an application rather than a served page:
-
-- **Starting it twice does not start two of them.** The second launch finds the
-  first, opens its page, and exits.
-- **Closing the window stops the server.** The open page pings the server every
-  20 seconds; after 90 seconds of silence the server stops by itself.
+- **Finished files open with one click.** They are already in the output
+  folder, so a file's row opens it with this computer's usual app, and the
+  folder named under the list opens the folder. Nothing is downloaded twice.
+- **Starting it twice does not start two of them.** The second launch brings
+  the open window forward and exits.
 - **Closing the window never abandons work.** A download or a transcription that
-  is already running finishes and writes its files first.
+  is already running finishes and writes its files first. The window hides
+  meanwhile, and comes back if you start CaptionForge again.
 
 On Linux this writes a `.desktop` entry and an icon under
 `~/.local/share`; on macOS a small bundle in `~/Applications`; on Windows a
 Start Menu shortcut. Only the Linux entry has been verified on real hardware.
+
+Coming from 0.7, where the window was a Chrome app: run
+`captionforge install-desktop` once more, so the entry matches the new window
+and the dock shows its icon, and delete
+`~/.local/share/captionforge/browser-window`, the browser profile the old
+window used.
 
 ## Usage
 
@@ -443,7 +447,7 @@ Run optional integrations explicitly:
 - No live streams, playlists, or translation
 - MP4 downloads offer 360p to 2160p, and only the heights a video publishes; other heights are not re-encoded into existence
 - The web interface covers `extract`, `transcribe`, and `download` only; settings, `clean`, `doctor`, and local file input stay on the command line
-- The desktop app is the same page in a window; the applications-menu entry has been verified on Linux only
+- The desktop app offers what the page offers; its applications-menu entry has been verified on Linux only
 - No authenticated or cookie-based access
 - No speaker diarization, translation, or aggressive spelling/grammar rewriting
 

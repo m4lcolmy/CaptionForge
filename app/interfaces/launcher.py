@@ -130,6 +130,10 @@ def desktop_entry(workdir: Path, command: tuple[str, ...]) -> str:
             "Categories=AudioVideo;Audio;Video;",
             "Keywords=subtitle;caption;transcript;youtube;whisper;srt;vtt;",
             "StartupNotify=true",
+            # The window's WM_CLASS instance, so the dock shows this icon for it.
+            f"StartupWMClass={ENTRY_NAME}",
+            # One window only: a second launch brings the first one forward.
+            "SingleMainWindow=true",
             f"X-CaptionForge-Version={VERSION}",
             "",
         )

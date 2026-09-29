@@ -67,10 +67,10 @@ PACKAGES: tuple[Package, ...] = (
         "uvicorn", "uvicorn", ">=0.30,<1.0", "Runs the local server the page talks to."
     ),
     Package(
-        "pywebview",
-        "webview",
-        ">=5.0,<7.0",
-        "Opens CaptionForge in a window of its own.",
+        "PySide6-Essentials",
+        "PySide6",
+        ">=6.7,<7.0",
+        "Draws the CaptionForge desktop window.",
     ),
     Package(
         "typer",

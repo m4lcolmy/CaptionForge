@@ -1,7 +1,7 @@
 # CaptionForge — How the App Works
 
 A working guide to the internals: what each layer does, what happens on every
-command, and which rules decide the output. Version 0.7.0, Python 3.12+.
+command, and which rules decide the output. Version 0.8.0, Python 3.12+.
 
 ---
 
@@ -36,7 +36,7 @@ without asking.
 app/
 ├── main.py              entry point → app.interfaces.cli:app  (console script "captionforge")
 ├── interfaces/cli.py    Typer commands, Rich rendering, error→exit-code mapping
-├── interfaces/desktop.py   one instance, one window, and a lifetime for the web app
+├── interfaces/desktop/  the Qt window: the page's sections as native widgets
 ├── interfaces/launcher.py  writes the applications-menu entry that starts it
 ├── services/            orchestration; the only place where a workflow is decided
 │   ├── video_service.py         URL validation + live/availability guards + discovery
@@ -122,7 +122,7 @@ Validated constraints that matter in practice:
 | `download` | metadata + **video and/or audio stream** | yes | `MediaService.download` |
 | `clean` | none | yes | local file → parse → post-process → export |
 | `web` | whatever the page asks for | yes | FastAPI app on `127.0.0.1` |
-| `desktop` | whatever the page asks for | yes | the same app, in a window |
+| `desktop` | whatever the window asks for | yes | a Qt window over the same services |
 | `install-desktop` | no | one desktop entry and one icon | `interfaces/launcher.py` |
 | `update` | PyPI | the packages you pick | `PackageUpdater.check` → ask → `install` |
 
@@ -135,28 +135,47 @@ Python text never reaches stdout/stderr — it goes to the log file.
 
 ### Desktop mode
 
-`captionforge desktop` ([app/interfaces/desktop.py](../app/interfaces/desktop.py))
-serves exactly what `web` serves — same `create_app`, same token, same page. It
-adds only the three behaviours an application needs and a served page does not:
+`captionforge desktop` ([app/interfaces/desktop/](../app/interfaces/desktop/))
+opens a Qt (PySide6) window that calls the services the web server calls, in the
+same process: `create_video_service().inspect_all` for a lookup, `JobRegistry`
+for captions and downloads, `PackageUpdater` for updates, and the web
+preferences file, so both front ends remember the same choices. There is no
+HTTP server, port, or token.
 
-1. **One instance.** The port and token are recorded in
-   `$XDG_RUNTIME_DIR/captionforge-desktop-<uid>.json`. A second launch probes
-   that server's `/api/health`; if it answers, the second launch opens its URL
-   and exits. A record left behind by a crash fails the probe and is deleted.
-2. **A window, best-effort.** `pywebview` if it is installed, otherwise a
-   Chromium-family browser started with `--app=<url>` (a window with no tab
-   strip or address bar), otherwise `webbrowser.open`. Only the first blocks, so
-   the other two wait on the server thread instead.
-3. **A lifetime.** `ActivityMiddleware` timestamps every request; the page pings
-   `/api/health` every 20 s. After `IDLE_GRACE_SECONDS` (90 s) with no request
-   the watchdog sets `server.should_exit` — unless `JobRegistry` still holds an
-   unfinished job, in which case the timer is reset and the work finishes first.
-   `SIGTERM` (logout) takes the same graceful path.
+- `theme.py` restates `app.css`: the same tokens for light and dark, the same
+  rules as a Qt style sheet, switched live when the system changes its colour
+  scheme. What Qt style sheets cannot express (`letter-spacing`, uppercase,
+  `opacity`, `:has()`, a 1.55 line height) the widgets do themselves.
+- `widgets.py` is the page's vocabulary: chips, option cards, the progress
+  track, file rows, the Options disclosure.
+- `window.py` builds the sections in the page's order and follows `app.js`:
+  it polls a job every 700 ms, saves choices 600 ms after the last change, and
+  offers a newer yt-dlp after a refusal. Slow calls run on a thread and answer
+  on the window's thread (`background.py`).
+- `application.py` owns the process:
+
+1. **One instance.** A `QLockFile` in `$XDG_RUNTIME_DIR` decides which copy is
+   first, and the first listens on a user-only local socket beside it. A later
+   launch knocks on the socket, the open window comes forward, and the later
+   launch exits. The lock is tied to its owner's PID, so a crash never blocks
+   the next start.
+2. **Named for the desktop.** `QApplication` starts with argv[0] set to
+   `captionforge`, which X11 uses as the WM_CLASS instance, and with
+   `desktopFileName` `captionforge`, the Wayland app id. The entry's
+   `StartupWMClass=captionforge` then lets GNOME show the window under the
+   CaptionForge icon.
+3. **A lifetime.** Closing the window while `JobRegistry` holds unfinished work
+   only hides it; the app ends when the last job does. `SIGTERM` (logout) and
+   Ctrl+C in a terminal end it at once.
+
+The CLI imports only `app/interfaces/desktop/__init__.py`, which does not import
+Qt, so everything else works without the `[desktop]` extra.
 
 `install-desktop` ([app/interfaces/launcher.py](../app/interfaces/launcher.py))
 writes an entry that runs `<sys.executable> -m app desktop` with `Path=` set to
 the folder the install ran in, which is what keeps the relative
 `default_output_folder`, `temp/`, and `logs/` pointing where the CLI puts them.
+It also declares `StartupWMClass=captionforge` and `SingleMainWindow=true`.
 
 ### Exit codes
 

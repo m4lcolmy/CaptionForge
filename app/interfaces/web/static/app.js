@@ -5,7 +5,6 @@
 
   const POLL_INTERVAL_MS = 700;
   const SAVE_DELAY_MS = 600;
-  const HEARTBEAT_MS = 20000;
 
   // Sizes are the on-disk faster-whisper downloads, rounded.
   const WHISPER_MODELS = [
@@ -165,18 +164,7 @@
     state.preferences = state.defaults.preferences || {};
     applyPreferences();
     watchForChanges();
-    keepAlive();
     offerUpdates();
-  }
-
-  // The desktop app has no terminal to close, so its server stops once no page
-  // is asking it for anything. An open page keeps saying that it is still here.
-  function keepAlive() {
-    setInterval(() => {
-      api("/api/health").catch(() => {
-        // A missed heartbeat is not worth an alert; the next one may land.
-      });
-    }, HEARTBEAT_MS);
   }
 
   function applyPreferences() {
