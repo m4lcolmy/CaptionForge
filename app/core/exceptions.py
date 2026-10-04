@@ -56,6 +56,22 @@ class LiveStreamNotSupportedError(VideoError):
     """Raised when a video is live or scheduled to become live."""
 
 
+class LocalMediaError(VideoError):
+    """Base class for problems with a video or audio file on this computer."""
+
+
+class LocalFileNotFoundError(LocalMediaError):
+    """Raised when a typed or pasted path names no file."""
+
+
+class UnreadableMediaFileError(LocalMediaError):
+    """Raised when a file cannot be opened, or FFmpeg cannot read it as media."""
+
+
+class NoAudioStreamError(LocalMediaError):
+    """Raised when a file has no sound in it to transcribe."""
+
+
 class MetadataRetrievalError(VideoError):
     """Raised when YouTube metadata retrieval fails."""
 

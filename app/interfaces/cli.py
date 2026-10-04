@@ -29,6 +29,7 @@ from app.core.exceptions import (
     ExtractorRefusedError,
     InvalidYouTubeUrlError,
     LiveStreamNotSupportedError,
+    LocalMediaError,
     MetadataRetrievalError,
     SubtitleDiscoveryError,
     UnsupportedYouTubeUrlError,
@@ -196,6 +197,11 @@ def doctor() -> None:
         else:
             ffmpeg_version = "Not available"
         table.add_row("FFmpeg version", ffmpeg_version)
+        ffprobe = FFmpegAdapter(config.ffmpeg_executable).probe_executable
+        table.add_row(
+            "FFprobe installed",
+            "Yes" if shutil.which(ffprobe) else "No - needed to read files",
+        )
         try:
             ytdlp_version = package_version("yt-dlp")
             table.add_row("yt-dlp installed", "Yes")
@@ -257,8 +263,8 @@ def doctor() -> None:
 def inspect(
     video_url: str = typer.Argument(
         ...,
-        metavar="VIDEO_URL",
-        help="An individual YouTube video URL.",
+        metavar="SOURCE",
+        help="A YouTube video URL, or a video or audio file on this computer.",
     ),
     language: str | None = typer.Option(
         None,
@@ -281,7 +287,7 @@ def inspect(
 
     def run(config: Config) -> None:
         preferred_language = language or config.default_language
-        result = _create_video_service().inspect(
+        result = _create_video_service(config).inspect(
             video_url, preferred_language, allow_translated=allow_translated
         )
         if json_output:
@@ -295,7 +301,9 @@ def inspect(
 @app.command()
 def transcribe(
     video_url: str = typer.Argument(
-        ..., metavar="VIDEO_URL", help="An individual YouTube video URL."
+        ...,
+        metavar="SOURCE",
+        help="A YouTube video URL, or a video or audio file on this computer.",
     ),
     language: str | None = typer.Option(
         None, "--language", "-l", help="Caption/transcription language."
@@ -349,12 +357,15 @@ def transcribe(
         help="Also consider YouTube machine-translated caption tracks.",
     ),
 ) -> None:
-    """Export existing captions or fall back to local faster-whisper."""
+    """Export existing captions or fall back to local faster-whisper.
+
+    A file on this computer has no captions to reuse, so it is always transcribed.
+    """
 
     def run(config: Config) -> None:
         adapter = YtDlpAdapter()
         subtitles = SubtitleService(config)
-        video_service = VideoService(adapter, subtitles)
+        video_service = VideoService(adapter, subtitles, config)
         service = TranscriptionService(
             video_service,
             adapter,
@@ -423,7 +434,9 @@ def transcribe(
 @app.command(name="prepare-audio")
 def prepare_audio(
     video_url: str = typer.Argument(
-        ..., metavar="VIDEO_URL", help="An individual YouTube video URL."
+        ...,
+        metavar="SOURCE",
+        help="A YouTube video URL, or a video or audio file on this computer.",
     ),
     language: str | None = typer.Option(
         None, "--language", "-l", help="Preferred caption language."
@@ -444,7 +457,7 @@ def prepare_audio(
     def run(config: Config) -> None:
         adapter = YtDlpAdapter()
         service = AudioService(
-            VideoService(adapter, SubtitleService(config)),
+            VideoService(adapter, SubtitleService(config), config),
             adapter,
             FFmpegAdapter(config.ffmpeg_executable),
             config,
@@ -516,9 +529,15 @@ def extract(
         output_directory = output or config.default_output_folder
         adapter = YtDlpAdapter()
         subtitle_service = SubtitleService(config)
-        discovery = VideoService(adapter, subtitle_service).inspect(
+        discovery = VideoService(adapter, subtitle_service, config).inspect(
             video_url, preferred, allow_translated=allow_translated
         )
+        video_id = discovery.video.video_id
+        if video_id is None:
+            raise SubtitleDiscoveryError(
+                "A file on this computer has no caption track to export. Run "
+                "'captionforge transcribe' to transcribe it locally."
+            )
         track = discovery.selected_track
         if track is None:
             translated = SubtitleService.translated_matches(discovery)
@@ -535,7 +554,7 @@ def extract(
             )
         segments = subtitle_service.retrieve_and_parse(
             adapter,
-            discovery.video.video_id,
+            video_id,
             track,
             postprocess=not no_postprocess,
         )
@@ -659,11 +678,12 @@ def clean(
             RawSubtitle(content=content, format=extension), track
         )
         destination = _clean_destination(input_file, output)
+        source = input_file.resolve()
         video = VideoMetadata(
-            video_id="localclean1",
             title=destination.stem,
-            webpage_url="file://local",
+            webpage_url=source.as_uri(),
             original_url=str(input_file),
+            local_path=source,
         )
         paths = ExportService().export(
             video,
@@ -838,7 +858,19 @@ def _render_inspection(result: SubtitleDiscoveryResult) -> None:
     details = Table(show_header=False, box=None)
     details.add_column("Field", style="cyan")
     details.add_column("Value")
-    details.add_row("Video ID", video.video_id)
+    if video.local_path is not None:
+        details.add_row("File", str(video.local_path))
+        details.add_row("Title", video.title)
+        details.add_row("Duration", _format_duration(video.duration_seconds))
+        details.add_row("Preferred language", result.preferred_language)
+        console.print(Panel(details, title="File Metadata"))
+        # A file carries no YouTube tracks, so there are no tables to fill.
+        console.print(
+            "\nA file on this computer has no caption tracks to reuse; "
+            "'captionforge transcribe' transcribes its audio locally."
+        )
+        return
+    details.add_row("Video ID", video.video_id or "")
     details.add_row("Title", video.title)
     details.add_row("Channel", video.channel_name or "Unknown")
     details.add_row("Duration", _format_duration(video.duration_seconds))
@@ -919,7 +951,9 @@ def _format_bytes(size: int | None) -> str:
 
 def _exit_code_for(exc: CaptionForgeError) -> int:
     """Map application errors to stable process exit codes."""
-    if isinstance(exc, (InvalidYouTubeUrlError, UnsupportedYouTubeUrlError)):
+    if isinstance(
+        exc, (InvalidYouTubeUrlError, UnsupportedYouTubeUrlError, LocalMediaError)
+    ):
         return ExitCode.INVALID_INPUT
     if isinstance(exc, (VideoUnavailableError, LiveStreamNotSupportedError)):
         return ExitCode.VIDEO_UNAVAILABLE

@@ -49,7 +49,7 @@ class AudioService:
         progress: ProgressCallback | None = None,
         discovery: SubtitleDiscoveryResult | None = None,
     ) -> Path:
-        """Inspect, download audio only, convert it, and return the WAV path."""
+        """Inspect, fetch the audio or read the file, convert it, return the WAV."""
         notify = progress or (lambda _message, _percent: None)
         notify("Validating video and checking captions", None)
         discovery = discovery or self._video_service.inspect(url, language)
@@ -74,16 +74,25 @@ class AudioService:
                 job_directory,
                 max(self._config.minimum_free_disk_bytes, duration * 64000),
             )
-            job.transition(JobStatus.PREPARING_AUDIO, stage="audio_download")
-            source = retry_call(
-                lambda: self._ytdlp.download_audio(
-                    discovery.video.video_id, created_directory, notify
-                ),
-                attempts=self._config.retry_count,
-                delay_seconds=self._config.retry_delay_seconds,
-                operation_name="audio_download",
-            )
-            job.downloaded_audio_path = source
+            video = discovery.video
+            if video.local_path is not None:
+                # A file on this computer is converted where it lies: nothing
+                # is copied, and the original is never moved or removed.
+                job.transition(JobStatus.PREPARING_AUDIO, stage="audio_conversion")
+                source = video.local_path
+            else:
+                video_id = video.video_id
+                assert video_id is not None
+                job.transition(JobStatus.PREPARING_AUDIO, stage="audio_download")
+                source = retry_call(
+                    lambda: self._ytdlp.download_audio(
+                        video_id, created_directory, notify
+                    ),
+                    attempts=self._config.retry_count,
+                    delay_seconds=self._config.retry_delay_seconds,
+                    operation_name="audio_download",
+                )
+                job.downloaded_audio_path = source
             notify("Converting audio to mono 16 kHz PCM WAV", None)
             inside_output = job_directory / f"prepared.{self._config.audio_format}"
             self._ffmpeg.convert(

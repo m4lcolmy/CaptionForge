@@ -19,6 +19,15 @@ MEDIA_AUDIO_KEY: Final[str] = "audio"
 MEDIA_AUDIO_BITRATE_KBPS: Final[int] = 192
 MEDIA_VIDEO_EXTENSION: Final[str] = "mp4"
 MEDIA_AUDIO_EXTENSION: Final[str] = "mp3"
+# Extensions that mark typed input as a file on this computer rather than a
+# link, and that the desktop file chooser lists. FFmpeg reads far more than
+# this; any other file can still be chosen or pasted by its full path.
+LOCAL_MEDIA_EXTENSIONS: Final[tuple[str, ...]] = (
+    "mp4", "mkv", "mov", "webm", "avi", "m4v", "wmv", "flv", "ts", "mts",
+    "mpg", "mpeg", "3gp",
+    "mp3", "m4a", "aac", "wav", "flac", "ogg", "oga", "opus", "wma", "aif",
+    "aiff", "amr", "mka",
+)  # fmt: skip
 
 
 class ExitCode:

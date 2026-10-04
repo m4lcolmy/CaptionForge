@@ -6,15 +6,22 @@ import socket
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import unquote
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.requests import ClientDisconnect
 
 from app.adapters import package_updater
 from app.adapters.whisper_adapter import CudaStatus
 from app.core.config import Config
-from app.core.constants import APP_NAME, SUPPORTED_OUTPUT_FORMATS, VERSION
+from app.core.constants import (
+    APP_NAME,
+    LOCAL_MEDIA_EXTENSIONS,
+    SUPPORTED_OUTPUT_FORMATS,
+    VERSION,
+)
 from app.core.exceptions import CaptionForgeError
 from app.core.logging_config import get_logger
 from app.interfaces.web import errors
@@ -32,10 +39,16 @@ from app.interfaces.web.schemas import (
     UpdateRequestBody,
 )
 from app.interfaces.web.security import LocalOnlyMiddleware
+from app.interfaces.web.uploads import UploadStore
+from app.models.job import JobStatus
 from app.services.factory import create_video_service
+from app.utils.local_media import local_media_path
 
 HOST = "127.0.0.1"
 STATIC_DIRECTORY = Path(__file__).parent / "static"
+# The chosen file's name, percent-encoded: a header carries only ASCII.
+FILENAME_HEADER = "X-CaptionForge-Filename"
+FINISHED = frozenset({JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED})
 
 
 def find_free_port() -> int:
@@ -54,11 +67,14 @@ def create_app(
 ) -> FastAPI:
     """Build the local application with its job registry and guards."""
     registry = JobRegistry(config)
+    uploads = UploadStore(config.temp_directory, config.minimum_free_disk_bytes)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        uploads.sweep_stale()
         yield
         registry.shutdown()
+        uploads.discard_all()
 
     application = FastAPI(
         title=f"{APP_NAME} local interface",
@@ -101,6 +117,9 @@ def create_app(
             # exist, otherwise one configured format. The CLI is unaffected.
             "preferences": resolve(load_preferences(preferences_file), config),
             "supported_formats": sorted(SUPPORTED_OUTPUT_FORMATS),
+            # What the file chooser lists, beside anything the system calls
+            # audio or video.
+            "local_media_extensions": list(LOCAL_MEDIA_EXTENSIONS),
             "default_model": config.default_whisper_model,
             "default_device": config.whisper_device,
             **_cuda_status(),
@@ -125,6 +144,40 @@ def create_app(
         return {
             **result.discovery.model_dump(mode="json"),
             "media": result.media.model_dump(mode="json"),
+        }
+
+    @application.put("/api/uploads", status_code=201, response_model=None)
+    async def upload(request: Request) -> dict[str, object] | JSONResponse:
+        """Take a copy of a file the page was handed.
+
+        A browser never tells a page where a file lives, so this is the only
+        way a chosen or dropped file reaches CaptionForge. The reply is the
+        copy's path, which the page then looks up like a pasted one.
+        """
+        length = request.headers.get("content-length", "")
+        try:
+            stored = await uploads.receive(
+                unquote(request.headers.get(FILENAME_HEADER, "")),
+                int(length) if length.isdigit() else None,
+                request.stream(),
+            )
+        except ClientDisconnect:
+            get_logger().info("The page stopped sending a file")
+            return JSONResponse(
+                {
+                    "error": "The copy was cancelled.",
+                    "code": "UploadCancelled",
+                    "retryable": False,
+                },
+                status_code=400,
+            )
+        # One copy at a time is enough: earlier ones go, unless a job that has
+        # not finished yet still has to read one.
+        uploads.prune(keep={stored, *_sources_in_use(registry)})
+        return {
+            "path": str(stored),
+            "name": stored.name,
+            "size_bytes": stored.stat().st_size,
         }
 
     @application.post("/api/jobs", status_code=202)
@@ -219,6 +272,18 @@ def create_app(
 
     application.mount("/static", StaticFiles(directory=STATIC_DIRECTORY), name="static")
     return application
+
+
+def _sources_in_use(registry: JobRegistry) -> set[Path]:
+    """Files that a job which has not finished yet will still read."""
+    sources: set[Path] = set()
+    for record in registry.recent():
+        if record.status in FINISHED:
+            continue
+        source = local_media_path(record.request.url)
+        if source is not None:
+            sources.add(source)
+    return sources
 
 
 def _cuda_status() -> dict[str, object]:

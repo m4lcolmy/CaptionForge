@@ -21,16 +21,19 @@
     <input
       id="url"
       name="url"
-      type="url"
+      type="text"
       required
-      placeholder="Paste a YouTube video link"
+      placeholder="Paste a YouTube link or a file's path"
       spellcheck="false"
-      aria-label="YouTube video link">
+      aria-label="YouTube link or file path">
     <button type="submit" class="btn-ghost" id="inspect-btn">Look up</button>
+    <button type="button" class="btn-ghost" id="choose-btn">Choose file</button>
+    <input type="file" id="file-input" accept="audio/*,video/*" hidden>
   </form>
 
-  <p class="note" id="hint">CaptionForge reuses the video's own captions when there
-    are any, and transcribes the audio on this computer when there aren't.</p>
+  <p class="note" id="hint">CaptionForge reuses a video's own captions when there
+    are any, and transcribes the audio on this computer when there aren't. Video
+    and audio files work too: choose one, drop it here, or paste its path.</p>
 
   <section class="alert" id="alert" hidden role="alert">
     <strong id="alert-title">Something went wrong</strong>

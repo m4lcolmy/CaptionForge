@@ -1,17 +1,24 @@
 """Offline tests for the local web interface."""
 
+import os
 import re
 import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app.adapters.ffmpeg_adapter import FFmpegAdapter, MediaProbe
 from app.core.config import Config
-from app.core.constants import MEDIA_AUDIO_KEY, MEDIA_VIDEO_HEIGHTS
+from app.core.constants import (
+    LOCAL_MEDIA_EXTENSIONS,
+    MEDIA_AUDIO_KEY,
+    MEDIA_VIDEO_HEIGHTS,
+)
 from app.core.exceptions import (
     InvalidYouTubeUrlError,
     MediaDownloadCancelledError,
@@ -22,6 +29,7 @@ from app.core.exceptions import (
 from app.interfaces.web import server as web_server
 from app.interfaces.web.jobs import JobRequest
 from app.interfaces.web.schemas import MediaJobRequestBody
+from app.interfaces.web.uploads import STALE_AFTER_SECONDS, UPLOAD_FOLDER, safe_name
 from app.models.media import MediaDownloadResult, MediaKind, MediaOptions, MediaVariant
 from app.models.subtitle import SubtitleDiscoveryResult
 from app.models.video import VideoMetadata
@@ -46,8 +54,10 @@ class StubWorkflowResult:
 
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[TestClient]:
-    """A test client wired to a server with a temporary output folder."""
-    config = Config(default_output_folder=tmp_path / "output")
+    """A test client wired to a server with temporary output and temp folders."""
+    config = Config(
+        default_output_folder=tmp_path / "output", temp_directory=tmp_path / "temp"
+    )
     application = web_server.create_app(
         config,
         token=TOKEN,
@@ -595,3 +605,193 @@ def test_the_page_offers_no_quality_the_api_cannot_resolve() -> None:
     for height in MEDIA_VIDEO_HEIGHTS:
         MediaJobRequestBody(url=VIDEO_URL, quality=str(height))
     MediaJobRequestBody(url=VIDEO_URL, quality=MEDIA_AUDIO_KEY)
+
+
+# ---------- files from this computer ----------
+
+
+def upload(client: TestClient, name: str, content: bytes = b"sound") -> dict[str, Any]:
+    """Hand the server a file the way the page's XMLHttpRequest does."""
+    response = client.put(
+        "/api/uploads",
+        content=content,
+        headers={**HEADERS, "X-CaptionForge-Filename": quote(name)},
+    )
+    assert response.status_code == 201, response.text
+    payload: dict[str, Any] = response.json()
+    return payload
+
+
+def stub_probe(monkeypatch: pytest.MonkeyPatch, *, has_audio: bool = True) -> None:
+    """Let FFprobe report a 90-second file without running it."""
+    monkeypatch.setattr(
+        FFmpegAdapter,
+        "probe",
+        lambda self, source: MediaProbe(duration_seconds=90.0, has_audio=has_audio),
+    )
+
+
+def test_health_lists_what_the_file_chooser_accepts(client: TestClient) -> None:
+    payload = client.get("/api/health", headers=HEADERS).json()
+    assert payload["local_media_extensions"] == list(LOCAL_MEDIA_EXTENSIONS)
+
+
+def test_a_chosen_file_is_copied_and_then_looked_up_by_path(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    stub_probe(monkeypatch)
+
+    stored = upload(client, "محاضرة 3.MP4", b"x" * 4096)
+
+    path = Path(stored["path"])
+    assert path.is_absolute()
+    assert path.is_relative_to(tmp_path / "temp" / UPLOAD_FOLDER)
+    assert path.name == "محاضرة 3.mp4"
+    assert path.read_bytes() == b"x" * 4096
+    assert stored["size_bytes"] == 4096
+
+    looked_up = client.post(
+        "/api/inspect", json={"url": stored["path"]}, headers=HEADERS
+    )
+    assert looked_up.status_code == 200
+    payload = looked_up.json()
+    assert payload["video"]["title"] == "محاضرة 3"
+    assert payload["video"]["local_path"] == stored["path"]
+    assert payload["video"]["duration_seconds"] == 90
+    assert payload["selected_track"] is None
+    assert payload["media"]["variants"] == []
+
+
+@pytest.mark.parametrize(
+    ("sent", "kept"),
+    [
+        ("../../etc/passwd", "passwd"),
+        ("C:\\fakepath\\talk.MKV", "talk.mkv"),
+        ("CON.mp4", "upload.mp4"),
+        ("notes.tar.gz", "notes.tar.gz"),
+        ("", "upload"),
+    ],
+)
+def test_an_uploaded_name_stays_inside_its_folder(sent: str, kept: str) -> None:
+    assert safe_name(sent) == kept
+
+
+def test_an_empty_file_is_refused_and_leaves_nothing(
+    client: TestClient, tmp_path: Path
+) -> None:
+    response = client.put(
+        "/api/uploads",
+        content=b"",
+        headers={**HEADERS, "X-CaptionForge-Filename": "talk.mp3"},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"] == "That file is empty."
+    assert not list((tmp_path / "temp" / UPLOAD_FOLDER).iterdir())
+
+
+def test_a_new_file_replaces_the_previous_copy(client: TestClient) -> None:
+    first = Path(upload(client, "one.mp3")["path"])
+    second = Path(upload(client, "two.mp3")["path"])
+    assert not first.parent.exists()
+    assert second.is_file()
+
+
+def test_a_copy_an_unfinished_job_still_reads_is_kept(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    running = threading.Event()
+
+    def process(url: str, **kwargs: Any) -> Any:
+        running.set()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not kwargs["cancelled"]():
+            time.sleep(0.01)
+        raise TranscriptionCancelledError("Transcription was cancelled.")
+
+    stub_workflow(monkeypatch, process)
+    first = Path(upload(client, "one.mp3")["path"])
+    job = client.post("/api/jobs", json={"url": str(first)}, headers=HEADERS)
+    assert running.wait(timeout=5.0)
+
+    upload(client, "two.mp3")
+
+    assert first.is_file()
+    client.post(f"/api/jobs/{job.json()['id']}/cancel", headers=HEADERS)
+    wait_for_terminal(client, job.json()["id"])
+
+
+def test_copies_go_when_the_server_stops(tmp_path: Path) -> None:
+    config = Config(
+        default_output_folder=tmp_path / "output", temp_directory=tmp_path / "temp"
+    )
+    application = web_server.create_app(
+        config, token=TOKEN, port=PORT, preferences_file=tmp_path / "prefs.json"
+    )
+    with TestClient(application, base_url=f"http://127.0.0.1:{PORT}") as test_client:
+        stored = Path(upload(test_client, "talk.mp3")["path"])
+        assert stored.is_file()
+    assert not stored.parent.exists()
+
+
+def test_copies_a_crashed_session_left_are_swept_at_start(tmp_path: Path) -> None:
+    uploads = tmp_path / "temp" / UPLOAD_FOLDER
+    stale, fresh = uploads / "stale", uploads / "fresh"
+    for folder in (stale, fresh):
+        folder.mkdir(parents=True)
+        (folder / "talk.mp3").write_bytes(b"x")
+    old = time.time() - STALE_AFTER_SECONDS - 60
+    os.utime(stale, (old, old))
+    config = Config(
+        default_output_folder=tmp_path / "output", temp_directory=tmp_path / "temp"
+    )
+    application = web_server.create_app(
+        config, token=TOKEN, port=PORT, preferences_file=tmp_path / "prefs.json"
+    )
+    with TestClient(application, base_url=f"http://127.0.0.1:{PORT}"):
+        pass
+    # Another server may still be using a recent copy.
+    assert not stale.exists() and fresh.exists()
+
+
+def test_a_file_without_sound_is_a_bad_request(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stub_probe(monkeypatch, has_audio=False)
+    stored = upload(client, "silent.mp4")
+    response = client.post(
+        "/api/inspect", json={"url": stored["path"]}, headers=HEADERS
+    )
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "That file has no sound to transcribe.",
+        "code": "NoAudioStreamError",
+        "retryable": False,
+        "update_may_help": False,
+    }
+
+
+def test_a_missing_path_is_a_bad_request(client: TestClient, tmp_path: Path) -> None:
+    response = client.post(
+        "/api/inspect", json={"url": str(tmp_path / "gone.mp4")}, headers=HEADERS
+    )
+    assert response.status_code == 400
+    assert response.json()["code"] == "LocalFileNotFoundError"
+
+
+def test_uploads_need_the_token(client: TestClient) -> None:
+    response = client.put(
+        "/api/uploads",
+        content=b"x",
+        headers={"Host": f"127.0.0.1:{PORT}", "X-CaptionForge-Filename": "a.mp3"},
+    )
+    assert response.status_code == 401
+
+
+def test_the_field_takes_a_path_and_the_page_takes_a_file() -> None:
+    """A url-typed field would refuse a path before the script saw it."""
+    markup = (web_server.STATIC_DIRECTORY / "index.html").read_text(encoding="utf-8")
+    field = re.search(r'<input\s+id="url"[^>]*>', markup)
+    assert field is not None
+    assert 'type="text"' in field.group(0)
+    assert 'id="choose-btn"' in markup
+    assert re.search(r'<input type="file" id="file-input"[^>]*hidden>', markup)

@@ -146,6 +146,13 @@ a:focus-visible {
 .source { display: flex; gap: 0.6rem; }
 .source input { flex: 1; }
 
+/* A file held over the page: the field is where it will land. */
+.source.dropping input {
+  border-color: var(--emerald);
+  border-style: dashed;
+  background: var(--sunk);
+}
+
 /* ---- buttons ---- */
 
 button { font: inherit; cursor: pointer; border-radius: var(--radius); }

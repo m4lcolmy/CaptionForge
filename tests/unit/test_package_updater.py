@@ -412,7 +412,7 @@ def test_the_terminal_asks_before_updating_yt_dlp_and_then_tries_again(
     service = RefusedOnce(
         fake, SubtitleDiscoveryResult(video=video_metadata, preferred_language="ar")
     )
-    monkeypatch.setattr(cli, "_create_video_service", lambda: service)
+    monkeypatch.setattr(cli, "_create_video_service", lambda _config=None: service)
 
     result = runner.invoke(cli.app, ["inspect", VIDEO_URL], input="y\nn\n")
 
@@ -431,7 +431,7 @@ def test_saying_no_installs_nothing(
     fake = FakeUpdater(updates=(YTDLP,))
     terminal(fake)
     service = RefusedOnce(fake, None)
-    monkeypatch.setattr(cli, "_create_video_service", lambda: service)
+    monkeypatch.setattr(cli, "_create_video_service", lambda _config=None: service)
 
     result = runner.invoke(cli.app, ["inspect", VIDEO_URL], input="n\n")
 
@@ -448,7 +448,9 @@ def test_a_script_is_never_asked_and_gets_the_command(
     fake = FakeUpdater(updates=(YTDLP,))
     monkeypatch.setattr(cli, "UPDATER", fake)
     monkeypatch.setattr(cli, "_interactive", lambda: False)
-    monkeypatch.setattr(cli, "_create_video_service", lambda: RefusedOnce(fake, None))
+    monkeypatch.setattr(
+        cli, "_create_video_service", lambda _config=None: RefusedOnce(fake, None)
+    )
 
     result = runner.invoke(cli.app, ["inspect", VIDEO_URL])
 

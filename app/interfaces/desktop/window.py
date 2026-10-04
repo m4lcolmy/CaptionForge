@@ -5,6 +5,7 @@ behaves the way ``app.js`` makes it behave. The window calls the services the
 web server calls, in the same process, so there is no server, port or token
 between them. Two things differ because a desktop app can do better than a
 page: finished files open with one click instead of downloading a second copy,
+a chosen or dropped file is read where it lies instead of being copied first,
 and closing the window never abandons a job that is still running.
 """
 
@@ -19,12 +20,23 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QCloseEvent, QDesktopServices, QImage, QPixmap, QResizeEvent
+from PySide6.QtCore import QMimeData, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import (
+    QCloseEvent,
+    QDesktopServices,
+    QDragEnterEvent,
+    QDragLeaveEvent,
+    QDragMoveEvent,
+    QDropEvent,
+    QImage,
+    QPixmap,
+    QResizeEvent,
+)
 from PySide6.QtWidgets import (
     QBoxLayout,
     QButtonGroup,
     QCheckBox,
+    QFileDialog,
     QFrame,
     QLabel,
     QLineEdit,
@@ -37,7 +49,12 @@ from PySide6.QtWidgets import (
 from app.adapters import package_updater
 from app.adapters.whisper_adapter import CudaStatus
 from app.core.config import Config
-from app.core.constants import APP_NAME, SUPPORTED_OUTPUT_FORMATS, VERSION
+from app.core.constants import (
+    APP_NAME,
+    LOCAL_MEDIA_EXTENSIONS,
+    SUPPORTED_OUTPUT_FORMATS,
+    VERSION,
+)
 from app.core.exceptions import CaptionForgeError
 from app.core.logging_config import get_logger
 from app.interfaces.desktop.background import run_in_background
@@ -58,6 +75,7 @@ from app.interfaces.desktop.widgets import (
     clear_layout,
     column,
     on_click,
+    repolish,
     row,
 )
 from app.interfaces.web.errors import GENERIC_MESSAGE, update_may_help
@@ -73,6 +91,7 @@ from app.models.media import MediaKind, MediaOptions, MediaVariant
 from app.models.subtitle import SubtitleTrack
 from app.services.factory import create_video_service
 from app.services.video_service import VideoInspection
+from app.utils.local_media import local_media_path
 
 POLL_INTERVAL_MS = 700
 SAVE_DELAY_MS = 600
@@ -128,6 +147,34 @@ def open_path(path: Path) -> bool:
     return QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
 
+# Both cases, because a file chooser may match patterns case-sensitively.
+MEDIA_FILE_FILTER = (
+    "Video and audio files ("
+    + " ".join(
+        f"*.{case}"
+        for extension in LOCAL_MEDIA_EXTENSIONS
+        for case in (extension, extension.upper())
+    )
+    + ");;All files (*)"
+)
+
+
+def choose_media_file(parent: QWidget, folder: str) -> str | None:
+    """Ask this computer's file chooser for one video or audio file."""
+    chosen, _ = QFileDialog.getOpenFileName(
+        parent, "Choose a video or audio file", folder, MEDIA_FILE_FILTER
+    )
+    return chosen or None
+
+
+def dropped_file(mime: QMimeData) -> Path | None:
+    """The first file on this computer that a drag carries, if any."""
+    for url in mime.urls() if mime.hasUrls() else ():
+        if url.isLocalFile():
+            return Path(url.toLocalFile())
+    return None
+
+
 @dataclass
 class Services:
     """Everything the window asks of the rest of CaptionForge.
@@ -141,6 +188,7 @@ class Services:
     cuda: Callable[[], CudaStatus]
     fetch: Callable[[str], bytes]
     open_path: Callable[[Path], bool]
+    choose_file: Callable[[QWidget, str], str | None]
 
     @classmethod
     def for_config(cls, config: Config) -> Services:
@@ -157,6 +205,7 @@ class Services:
             cuda=CudaStatus.probe,
             fetch=fetch_bytes,
             open_path=open_path,
+            choose_file=choose_media_file,
         )
 
 
@@ -317,6 +366,7 @@ class MainWindow(QMainWindow):
         self._update_ticket = 0
         self._thumb_ticket = 0
         self._update_boxes: list[tuple[OptionCard, QCheckBox]] = []
+        self._file_folder: Path | None = None
 
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(POLL_INTERVAL_MS)
@@ -332,6 +382,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(420, 420)
         self._build()
+        # A file dropped anywhere on the window is taken, including on a
+        # field, which would otherwise swallow it as the text of its address.
+        self.setAcceptDrops(True)
+        for field in self.findChildren(QLineEdit):
+            field.setAcceptDrops(False)
         self._start()
 
     # ---------- building ----------
@@ -348,8 +403,9 @@ class MainWindow(QMainWindow):
         main = self.page.main
         main.addWidget(self._build_source())
         self.hint = Label(
-            "CaptionForge reuses the video's own captions when there are any, "
-            "and transcribes the audio on this computer when there aren't."
+            "CaptionForge reuses a video's own captions when there are any, and "
+            "transcribes the audio on this computer when there aren't. Video and "
+            "audio files work too: choose one, drop it here, or paste its path."
         )
         main.addWidget(self.hint)
         main.addWidget(self._build_alert())
@@ -376,13 +432,16 @@ class MainWindow(QMainWindow):
         box = QWidget()
         self._source_layout = row(10)
         self.url = QLineEdit()
-        self.url.setPlaceholderText("Paste a YouTube video link")
-        self.url.setAccessibleName("YouTube video link")
+        self.url.setPlaceholderText("Paste a YouTube link or a file's path")
+        self.url.setAccessibleName("YouTube link or file path")
         self.url.returnPressed.connect(self.look_up)
         self.inspect_button = Button("Look up", "ghost")
         on_click(self.inspect_button, self.look_up)
+        self.choose_button = Button("Choose file", "ghost")
+        on_click(self.choose_button, self.choose_file)
         self._source_layout.addWidget(self.url, 1)
         self._source_layout.addWidget(self.inspect_button)
+        self._source_layout.addWidget(self.choose_button)
         box.setLayout(self._source_layout)
         return box
 
@@ -848,6 +907,7 @@ class MainWindow(QMainWindow):
         """Stop every other action while one thing runs."""
         self._running = busy
         self.inspect_button.setEnabled(not busy)
+        self.choose_button.setEnabled(not busy)
         self.run_button.setEnabled(not busy)
         # One click starts a download, so every other one has to stop working
         # while a job runs: two writes to the output folder at once help nobody.
@@ -895,9 +955,67 @@ class MainWindow(QMainWindow):
         self.video.hide()
         self.media.hide()
         self.tracks.hide()
-        self.show_alert("Could not read that video", message_for(error, "lookup"))
+        local = local_media_path(self.url.text()) is not None
+        self.show_alert(
+            "Could not read that file" if local else "Could not read that video",
+            message_for(error, "lookup"),
+        )
         if isinstance(error, CaptionForgeError) and update_may_help(error):
             self.offer_updates(refused=True)
+
+    # ---------- files from this computer ----------
+
+    def choose_file(self) -> None:
+        """Pick a video or audio file and look it up straight away."""
+        if self._running:
+            return
+        folder = self._file_folder or Path.home()
+        chosen = self._services.choose_file(self, str(folder))
+        if chosen:
+            self.take_file(Path(chosen))
+
+    def take_file(self, path: Path) -> None:
+        """Look a file up where it lies; unlike the page, nothing is copied."""
+        if self._running:
+            return
+        self._file_folder = path.parent
+        self.url.setText(str(path))
+        self.look_up()
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
+        """Take a file held over the window, and show where it will land."""
+        if self._running or dropped_file(event.mimeData()) is None:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self._show_drop_target(True)
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:  # noqa: N802
+        """Keep accepting while the file moves across the window."""
+        if self._running or dropped_file(event.mimeData()) is None:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:  # noqa: N802
+        """The file was carried away again."""
+        self._show_drop_target(False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802 - Qt's own name
+        """Look the dropped file up, as if it had been chosen."""
+        self._show_drop_target(False)
+        path = dropped_file(event.mimeData())
+        if self._running or path is None:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self.take_file(path)
+
+    def _show_drop_target(self, shown: bool) -> None:
+        """``.source.dropping input``: the field is where a dropped file goes."""
+        self.url.setProperty("dropping", "true" if shown else "false")
+        repolish(self.url)
 
     def render_inspection(self, result: VideoInspection) -> None:
         """Fill the video, download, track and control sections from one lookup."""
@@ -946,7 +1064,13 @@ class MainWindow(QMainWindow):
             if selected
             else "No matching track, so the audio will be transcribed on this computer."
         )
-        self.tracks.show()
+        # A file has no published tracks to list, and is always transcribed, so
+        # the button says so and the two caption-track options step aside.
+        local = video.is_local
+        self.tracks.setVisible(not local)
+        self.force.setVisible(not local)
+        self.allow_translated.setVisible(not local)
+        self.run_button.setText("Transcribe" if local else "Get captions")
         self.controls.show()
 
     def _fetch_thumbnail(self, url: str, ticket: int) -> None:
@@ -1382,4 +1506,10 @@ class MainWindow(QMainWindow):
         self._registry.shutdown()
 
 
-__all__ = ["MainWindow", "Services", "format_duration", "format_size"]
+__all__ = [
+    "MainWindow",
+    "Services",
+    "choose_media_file",
+    "format_duration",
+    "format_size",
+]

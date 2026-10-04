@@ -289,6 +289,9 @@ QLineEdit {{
   selection-background-color: {EMERALD}; selection-color: {ON_VIVID};
 }}
 QLineEdit:focus {{ border: 2px solid {EMERALD}; padding: 9px 12px; }}
+QLineEdit[dropping="true"] {{
+  border: 1px dashed {EMERALD}; padding: 10px 13px; background: {p.sunk};
+}}
 
 /* ---- buttons ---- */
 

@@ -2,7 +2,8 @@
 
 CaptionForge downloads and exports existing YouTube captions. When no matching
 caption exists, it prepares mono 16 kHz audio and transcribes it locally with
-`faster-whisper`. It can also save the video itself as an MP4 at a chosen
+`faster-whisper`. It transcribes video and audio files already on your computer
+the same way. It can also save a YouTube video itself as an MP4 at a chosen
 quality, or its audio alone as an MP3.
 
 The caption and transcription workflows still never fetch the video stream:
@@ -12,6 +13,8 @@ the page's download row.
 ## Features
 
 - Run the whole workflow from a browser on your own machine
+- Transcribe a video or audio file from this computer: choose it, drop it, or
+  paste its path
 - Or install it as a desktop app and start it from your applications list
 - Inspect video metadata and available caption tracks
 - Select captions by preferred language
@@ -33,7 +36,9 @@ the page's download row.
 - Persist validated settings and write output files atomically
 - Keep rotating technical logs separate from concise CLI errors
 
-CaptionForge currently works with individual, non-live YouTube videos.
+CaptionForge works with individual, non-live YouTube videos, and with single
+video or audio files on this computer (anything FFmpeg can read: MP4, MKV, MOV,
+WebM, MP3, M4A, WAV, FLAC, OGG, Opus, and more).
 
 ## Installation
 
@@ -67,6 +72,17 @@ CaptionForge prints a `http://127.0.0.1:PORT/?t=TOKEN` link and opens it. Paste 
 video link, pick a language and formats, and download the results. Nothing is
 uploaded anywhere: yt-dlp, FFmpeg, and faster-whisper all run locally, exactly as
 they do for the commands below.
+
+A file on this computer works too. Click **Choose file**, drop the file anywhere
+on the page, or paste its path into the link field. A file has no caption tracks
+to reuse, so the page skips that section, and its button reads **Transcribe**.
+The transcript is named after the file: `lecture.mp4` gives `lecture.srt`.
+
+A browser never tells a page where a chosen or dropped file lives, so the page
+hands CaptionForge a copy, kept in `temp/uploads/` on this computer. The copy is
+removed when you choose another file, and when CaptionForge stops. Pasting the
+path instead reads the file where it is, with no copy, which is the better
+choice for a large video.
 
 Looking a video up also fills in a **Download the file** row: one chip per
 quality that video actually publishes, each showing its approximate size, with
@@ -129,6 +145,9 @@ A few things differ from the page, because an application can do better:
 - **Finished files open with one click.** They are already in the output
   folder, so a file's row opens it with this computer's usual app, and the
   folder named under the list opens the folder. Nothing is downloaded twice.
+- **A file is read where it lies.** Choose file opens this computer's own file
+  chooser, and a file dropped anywhere on the window is taken. Either way, the
+  window reads it in place instead of copying it first.
 - **Starting it twice does not start two of them.** The second launch brings
   the open window forward and exits.
 - **Closing the window never abandons work.** A download or a transcription that
@@ -189,6 +208,19 @@ captionforge transcribe "https://youtu.be/qJFbKl6RjLU" \
   --language ar --model small --device auto --compute-type auto \
   --format srt --format txt --output ./output
 ```
+
+Transcribe a video or audio file on this computer instead of a link:
+
+```bash
+captionforge transcribe ~/Videos/lecture.mp4 --language ar --format srt
+captionforge transcribe "/home/me/Voice notes/meeting.m4a" --format docx
+```
+
+A file has no captions to reuse, so it always goes to Whisper. The file itself
+is read, never moved or changed; the transcript lands in the output folder,
+named after the file. `inspect` shows a file's length, and a file with no sound
+in it is refused before any model loads. `extract` and `download` are for
+YouTube only, and say so if given a file.
 
 The command reuses a suitable YouTube caption by default. Use `--force` to run
 Whisper anyway, `--keep-audio` to preserve prepared audio, and `--overwrite` to
@@ -256,8 +288,8 @@ used straight away; other packages take effect the next time CaptionForge
 starts. `captionforge config set check_for_updates false` stops CaptionForge
 from looking by itself; `captionforge update` still works.
 
-Run `captionforge doctor` to check FFmpeg, yt-dlp, faster-whisper, python-docx,
-CUDA, the detected GPU, recommendations, and folder access. Doctor never
+Run `captionforge doctor` to check FFmpeg and FFprobe, yt-dlp, faster-whisper,
+python-docx, CUDA, the detected GPU, recommendations, and folder access. Doctor never
 downloads a model.
 
 Post-processing is enabled for both downloaded captions and Whisper results. Use
@@ -350,6 +382,10 @@ files unless preservation was requested.
 
 - Run `captionforge doctor` to check FFmpeg, CUDA, dependencies, disk paths, and
   write access.
+- **"FFprobe … is not installed"** when looking a file up: FFprobe ships with
+  FFmpeg, and CaptionForge uses it to read a file's length and check it has
+  sound. Install the full FFmpeg package. With `ffmpeg_executable` set to a
+  custom path, FFprobe is expected in the same folder.
 - **HTTP 403 on audio or captions** means yt-dlp can no longer read YouTube's
   current site. Retrying never fixes it; a newer yt-dlp does. When this
   happens in a terminal, CaptionForge checks for one, shows it, and asks
@@ -444,9 +480,11 @@ Run optional integrations explicitly:
 
 ## Limitations
 
-- No live streams, playlists, or translation
+- No live streams, playlists, folders of files, or translation
+- Subtitle tracks embedded in a file (an MKV's, for example) are not read; a
+  file is always transcribed
 - MP4 downloads offer 360p to 2160p, and only the heights a video publishes; other heights are not re-encoded into existence
-- The web interface covers `extract`, `transcribe`, and `download` only; settings, `clean`, `doctor`, and local file input stay on the command line
+- The web interface covers `extract`, `transcribe` (for links and files), and `download` only; settings, `clean`, and `doctor` stay on the command line
 - The desktop app offers what the page offers; its applications-menu entry has been verified on Linux only
 - No authenticated or cookie-based access
 - No speaker diarization, translation, or aggressive spelling/grammar rewriting

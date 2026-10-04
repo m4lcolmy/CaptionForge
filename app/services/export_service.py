@@ -52,7 +52,7 @@ class ExportService:
                 f"Unsupported output format(s): {', '.join(sorted(unknown))}"
             )
         directory = ensure_output_directory(output_directory)
-        stem = sanitize_filename(video.title, fallback=video.video_id)
+        stem = sanitize_filename(video.title, fallback=video.video_id or "captions")
         if not overwrite:
             stem = available_stem(directory, stem, normalized)
         paths = tuple(directory / f"{stem}.{extension}" for extension in normalized)

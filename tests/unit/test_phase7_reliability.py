@@ -127,7 +127,7 @@ def test_config_cli_set_show_and_reset(
 def test_unexpected_cli_error_is_friendly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(cli, "_create_video_service", lambda: 1 / 0)
+    monkeypatch.setattr(cli, "_create_video_service", lambda _config=None: 1 / 0)
 
     result = CliRunner().invoke(cli.app, ["inspect", "https://youtu.be/qJFbKl6RjLU"])
 

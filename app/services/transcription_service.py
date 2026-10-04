@@ -27,6 +27,7 @@ from app.services.resilient_transcription import ResilientTranscriber
 from app.services.subtitle_service import SubtitleService
 from app.services.video_service import VideoService
 from app.utils.file_utils import cleanup_path
+from app.utils.local_media import local_media_path
 
 ProgressCallback = Callable[[str, float | None], None]
 CancelCallback = Callable[[], bool]
@@ -87,7 +88,11 @@ class TranscriptionService:
         progress: ProgressCallback | None = None,
         cancelled: CancelCallback | None = None,
     ) -> TranscriptionWorkflowResult:
-        """Inspect, select the appropriate source, transcribe if needed, and export."""
+        """Inspect, select the appropriate source, transcribe if needed, and export.
+
+        ``url`` is a YouTube link or a video or audio file on this computer. A
+        file has no caption tracks, so it always goes to Whisper.
+        """
         notify = progress or (lambda _message, _percent: None)
         is_cancelled = cancelled or (lambda: False)
         selected_language = language or self._config.whisper_language
@@ -99,7 +104,10 @@ class TranscriptionService:
         preserve_audio = keep_audio or self._config.keep_temp_files
         try:
             self._check_cancelled(is_cancelled)
-            notify("Inspecting video", 5.0)
+            notify(
+                "Reading the file" if local_media_path(url) else "Inspecting video",
+                5.0,
+            )
             discovery = self._video_service.inspect(
                 url, inspection_language, allow_translated=allow_translated
             )
@@ -108,10 +116,13 @@ class TranscriptionService:
             destination = output_directory or self._config.default_output_folder
 
             if track is not None and not force:
+                video_id = discovery.video.video_id
+                # Only YouTube publishes caption tracks; a file never has one.
+                assert video_id is not None
                 notify("Using existing captions", 25.0)
                 segments = self._subtitle_service.retrieve_and_parse(
                     self._ytdlp,
-                    discovery.video.video_id,
+                    video_id,
                     track,
                     postprocess=postprocess,
                 )
@@ -165,8 +176,8 @@ class TranscriptionService:
             selected_model = model_name or self._config.default_whisper_model
             selected_device = device or self._config.whisper_device
             log.info(
-                "Transcription selected_method=whisper video_id={} model={} device={}",
-                discovery.video.video_id,
+                "Transcription selected_method=whisper source={} model={} device={}",
+                discovery.video.video_id or discovery.video.local_path,
                 selected_model,
                 selected_device,
             )

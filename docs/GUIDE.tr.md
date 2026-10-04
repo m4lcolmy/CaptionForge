@@ -8,15 +8,18 @@ komutta ne oluyor ve çıktıyı hangi kurallar belirliyor. Sürüm 0.8.0, Pytho
 
 ## 1. Uygulama gerçekte ne yapıyor
 
-CaptionForge tek bir YouTube video URL'sini altyazı/transkript dosyalarına
-(`srt`, `vtt`, `txt`, `json`, `docx`) dönüştürür. İki metin kaynağı vardır ve her zaman
+CaptionForge tek bir YouTube video URL'sini veya bu bilgisayardaki bir video ya
+da ses dosyasını altyazı/transkript dosyalarına (`srt`, `vtt`, `txt`, `json`,
+`docx`) dönüştürür. İki metin kaynağı vardır ve her zaman
 ucuz olanı tercih eder:
 
 1. **Mevcut YouTube altyazıları** — yalnızca altyazı izi indirilir, medya
    indirilmez.
 2. **Yerel transkripsiyon** — yalnızca istenen dilde eşleşen bir altyazı yoksa
    (veya `--force` verildiyse). Sadece ses akışı indirilir, mono 16 kHz PCM WAV'a
-   dönüştürülür ve yerel makinede `faster-whisper`'a verilir.
+   dönüştürülür ve yerel makinede `faster-whisper`'a verilir. Bu bilgisayardaki
+   bir dosyanın YouTube altyazısı olmadığından her zaman bu yolu izler; sesi
+   indirilmez, dosya bulunduğu yerde dönüştürülür.
 
 Hiçbir yolda video akışı indirilmez. YouTube (`yt-dlp` üzerinden), ilk model
 indirmesinde Whisper model sunucusu ve CaptionForge kendi paketlerinin yeni
@@ -34,7 +37,7 @@ app/
 ├── interfaces/desktop/  Qt penceresi: sayfanın bölümleri, yerel bileşenler olarak
 ├── interfaces/launcher.py  uygulamayı başlatan menü girdisini yazar
 ├── services/            orkestrasyon; iş akışının kararlaştırıldığı tek yer
-│   ├── video_service.py         URL doğrulama + canlı/erişilebilirlik kontrolleri + keşif
+│   ├── video_service.py         URL veya dosya → doğrulama + kontroller + keşif
 │   ├── subtitle_service.py      iz seçimi, altyazı ayrıştırma, asgari temizlik
 │   ├── audio_service.py         iş alanı, ses indirme, FFmpeg dönüştürme
 │   ├── transcription_service.py altyazı-öncelikli akış, Whisper yedeği, dışa aktarım
@@ -42,11 +45,11 @@ app/
 │   └── export_service.py        format doğrulama, dosya adı, atomik çok formatlı yazma
 ├── adapters/            dış dünyayla konuşan her şey
 │   ├── ytdlp_adapter.py    meta veri, altyazı indirme, ses indirme, hata çevirisi
-│   ├── ffmpeg_adapter.py   alt süreç (shell yok), dönüştürme, hata çevirisi
+│   ├── ffmpeg_adapter.py   alt süreç (shell yok), dönüştürme, FFprobe, hata çevirisi
 │   └── whisper_adapter.py  tembel faster-whisper importu, cihaz/hesaplama seçimi
 ├── models/              donmuş (frozen) Pydantic sözleşmeleri (VideoMetadata, SubtitleTrack, …)
 ├── exporters/           saf render fonksiyonları: segmentler → metin
-├── utils/               saf yardımcılar (URL, zaman, dil, dosya adı, Arapça metin)
+├── utils/               saf yardımcılar (URL, yerel yol, zaman, dil, dosya adı, Arapça metin)
 └── core/                yapılandırma, sabitler, istisna hiyerarşisi, retry, loglama
 ```
 
@@ -120,6 +123,11 @@ Pratikte önem taşıyan doğrulama kuralları:
 | `install-desktop` | hayır | bir masaüstü girdisi ve bir simge | `interfaces/launcher.py` |
 | `update` | PyPI | seçtiğiniz paketler | `PackageUpdater.check` → sor → `install` |
 
+Bağlantı yerine bu bilgisayardaki bir dosya verildiğinde `inspect`, `transcribe`
+ve `prepare-audio` (ilk model indirmesi dışında) hiç ağ çağrısı yapmaz; `extract`
+ve `download` ise dosyayı, yerine ne çalıştırılacağını söyleyen bir cümleyle
+reddeder.
+
 Her komut `_run_with_config` üzerinden geçer ve aynı dört işi yapar:
 yapılandırmayı yükle, loglamayı ayarla, eylemi çalıştır, istisnaları kısa bir
 kullanıcı mesajı ile bir çıkış koduna çevir. Eylem `ExtractorRefusedError` ile
@@ -147,7 +155,10 @@ sunucusu, port ya da token yoktur.
   700 ms'de bir yoklar, son değişiklikten 600 ms sonra seçimleri kaydeder,
   YouTube reddettiğinde daha yeni bir yt-dlp önerir. Yavaş çağrılar ayrı bir iş
   parçacığında çalışır ve sonucu pencerenin iş parçacığına iletir
-  (`background.py`).
+  (`background.py`). Choose file sistemin dosya seçicisini açar; pencerenin
+  herhangi bir yerine bırakılan bir dosya da alınır (metin alanları bırakmayı
+  reddeder, böylece dosyayı yutamazlar). Her iki durumda da yol alana yazılır ve
+  dosya kopyalanmadan bulunduğu yerde incelenir.
 - `application.py` sürecin kendisini yönetir:
 
 1. **Tek örnek.** `$XDG_RUNTIME_DIR` içindeki bir `QLockFile` hangi kopyanın
@@ -180,14 +191,14 @@ Girdi ayrıca `StartupWMClass=captionforge` ve `SingleMainWindow=true` bildirir.
 |---|---|
 | 0 | başarılı |
 | 1 | genel hata (beklenmeyen istisnalar dâhil) |
-| 2 | geçersiz veya desteklenmeyen YouTube URL'si |
+| 2 | geçersiz veya desteklenmeyen YouTube URL'si; ya da bulunamayan, okunamayan veya sessiz bir dosya |
 | 3 | video erişilemez veya canlı yayın |
 | 4 | meta veri alma hatası |
 | 130 | `KeyboardInterrupt` |
 
 ---
 
-## 5. İnceleme yolu (YouTube'a dokunan her şeyin ortak yolu)
+## 5. İnceleme yolu (bağlantı veya dosya alan her şeyin ortak yolu)
 
 1. **`extract_youtube_video_id`** ([app/utils/url_utils.py](../app/utils/url_utils.py))
    — saf ayrıştırma, ağ yok. `youtube.com`, `www`, `m`, `music` ve `youtu.be`
@@ -212,6 +223,51 @@ Girdi ayrıca `StartupWMClass=captionforge` ve `SingleMainWindow=true` bildirir.
    is_upcoming}` → `LiveStreamNotSupportedError`; `availability in {private,
    subscriber_only, premium_only}` → `VideoUnavailableError`.
 7. **Seçim** — `SubtitleService.discover`'a devredilir.
+
+### Bu bilgisayardaki dosyalar
+
+`VideoService.inspect_all` önce `local_media_path`'e
+([app/utils/local_media.py](../app/utils/local_media.py)) girdinin bir dosyayı
+gösterip göstermediğini sorar. Sistemlerin yolları kopyaladığı biçimlerin hepsini
+kabul eder: düz yol, tırnak içinde yol, `~/…`, `file://` URI'leri (yüzde
+kodlaması çözülür, `localhost` kabul edilir, başka bir sunucu reddedilir),
+Windows sürücü yolları, `./` ve `../`, `LOCAL_MEDIA_EXTENSIONS` içindeki bir
+medya uzantısını taşıyan çıplak bir ad ve var olan bir dosyanın adı. `file:`
+dışında bir URL şeması taşıyan her şey bağlantıdır. Hiçbir şeyi göstermeyen bir
+yol, bozuk bir YouTube URL'si olarak değil, bulunamayan bir dosya olarak
+bildirilir.
+
+Ardından, yt-dlp hiç devreye girmeden:
+
+1. `resolve_media_file` yolu mutlak yapar (FFprobe çıplak bir `-ad` değerini
+   seçenek olarak okur) ve bulunamayan bir yol ya da klasör için
+   `LocalFileNotFoundError`, kullanıcının okuyamadığı bir dosya için
+   `UnreadableMediaFileError` fırlatır.
+2. `FFmpegAdapter.probe`, yapılandırılmış FFmpeg'in yanında bulunan FFprobe'u
+   (`/opt/ff/ffmpeg` → `/opt/ff/ffprobe`) `-show_format -show_streams` ile JSON
+   çıktısında çalıştırır. Süreyi (kapsayıcınınkini, yoksa en uzun akışınkini) ve
+   herhangi bir akışın ses olup olmadığını okur. FFprobe'un reddettiği bir dosya
+   `UnreadableMediaFileError`, sesi olmayan bir dosya ise `NoAudioStreamError`
+   olur; bu, bir model yüklendikten sonra değil, burada reddedilir.
+3. Sonuç, `local_path` dolu ve `video_id` `None` olan bir `VideoMetadata`'dır
+   (bir model doğrulayıcısı ikisinden tam olarak birini ister). Başlık dosyanın
+   gövde adıdır, böylece `lecture.mp4` `lecture.srt` olarak dışa aktarılır;
+   altyazı izi yoktur ve `MediaOptions` boştur, bu da sayfadaki indirme satırını
+   gizler.
+
+Bu üç hatanın hepsi `LocalMediaError`'dır: sayfada HTTP 400, terminalde çıkış
+kodu 2.
+
+Tarayıcı, seçilen ya da bırakılan bir dosyanın nerede durduğunu sayfaya asla
+söylemez; bu yüzden sayfa dosyanın baytlarını `/api/uploads`'a `PUT` eder
+([app/interfaces/web/uploads.py](../app/interfaces/web/uploads.py)). Sunucu
+bunları `<temp_directory>/uploads/<uuid>/<ad>` konumuna yazar (`0o700` modu,
+temizlenmiş ad, önce disk alanı kontrolü) ve bu mutlak yolla yanıt verir. Sayfa
+ardından bu yolu yapıştırılmış bir yol gibi inceler. Daha yeni bir kopya, henüz
+bitmemiş bir işin hâlâ okuduğu kopya hariç eskilerin yerini alır; sunucu
+durduğunda tüm kopyalar silinir, bir çökmeden kalan ve bir günden eski kopyalar
+da açılışta süpürülür. Yolu yapıştırmak kopyayı atlar; masaüstü penceresi hiç
+kopya yapmaz.
 
 ### İz seçim kuralları
 
@@ -288,7 +344,7 @@ incele (%5)
   └── aksi hâlde
         sesi hazırla (%10 → %25)
           ├── iş dizini oluştur + disk kontrolü
-          ├── yt-dlp bestaudio indirme
+          ├── yt-dlp bestaudio indirme   (dosyada atlanır)
           └── ffmpeg → mono 16 kHz PCM WAV
         modeli yükle (%30)
         transkribe et (%40 → %85)
@@ -312,7 +368,8 @@ bilinmiyorsa `min(84, 40 + segment_sırası)` şeklinde yavaş bir sayaca düşe
   birlikte karşılamak için. Süre bilinmiyorsa 600 sn varsayılır.
 - `yt-dlp`, `format: "bestaudio"` ile. "requested format is not available"
   hatası `AudioFormatUnavailableError`'a, diğer her şey yeniden denenebilir
-  `AudioDownloadError`'a çevrilir.
+  `AudioDownloadError`'a çevrilir. Bu bilgisayardaki bir dosya indirmeyi atlar:
+  FFmpeg onu yerinde okur; dosya asla taşınmaz, kopyalanmaz veya silinmez.
 - FFmpeg asla shell üzerinden değil, argüman listesiyle çağrılır:
   `-y -i <kaynak> -vn -acodec pcm_s16le -ar 16000 -ac 1 <hedef>`. Sonrasında
   çıktının var olduğu ve boş olmadığı doğrulanır. `audio_format` yalnızca dosya
@@ -622,9 +679,11 @@ integration` ile çalıştırılır.
 
 ## 14. Bilinen sınırlar ve pürüzler
 
-Kasıtlı sınırlar: yalnızca tekil, canlı olmayan videolar; oynatma listesi,
-kanal, canlı yayın, çeviri, konuşmacı ayrıştırma, çerez/kimlikli erişim veya GUI
-yok; agresif yazım/dilbilgisi yeniden yazımı yok.
+Kasıtlı sınırlar: yalnızca tekil, canlı olmayan videolar veya tek tek dosyalar;
+oynatma listesi, kanal, klasör, canlı yayın, çeviri, konuşmacı ayrıştırma veya
+çerez/kimlikli erişim yok; agresif yazım/dilbilgisi yeniden yazımı yok. Bir
+dosyaya gömülü altyazı izleri (örneğin bir MKV'ninkiler) okunmaz: dosya her
+zaman transkribe edilir.
 
 Mevcut koddaki, bilinmesinde fayda olan pürüzler:
 
@@ -639,6 +698,6 @@ Mevcut koddaki, bilinmesinde fayda olan pürüzler:
   `audio_format` yalnızca dosya uzantısını etkiliyor.
 - `configure_logging`'in docstring'i konsol ve dosya handler'ından söz ediyor,
   ancak yalnızca dosya handler'ı kaydediliyor.
-- `clean` komutu `ExportService`'i yeniden kullanabilmek için `localclean1`
-  sentetik kimliğiyle bir yer tutucu `VideoMetadata` kuruyor; dosya sonrasında
-  istenen hedefe yeniden adlandırılıyor.
+- `clean` komutu `ExportService`'i yeniden kullanabilmek için girdi dosyası için
+  bir `VideoMetadata` kuruyor; sonuç sonrasında istenen hedefe yeniden
+  adlandırılıyor.

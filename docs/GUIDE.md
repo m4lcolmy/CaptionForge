@@ -7,15 +7,17 @@ command, and which rules decide the output. Version 0.8.0, Python 3.12+.
 
 ## 1. What the app actually does
 
-CaptionForge turns a single YouTube video URL into subtitle/transcript files
-(`srt`, `vtt`, `txt`, `json`, `docx`). It has two sources of text and always
-prefers the cheap one:
+CaptionForge turns a single YouTube video URL, or a video or audio file on this
+computer, into subtitle/transcript files (`srt`, `vtt`, `txt`, `json`, `docx`).
+It has two sources of text and always prefers the cheap one:
 
 1. **Existing YouTube captions** — downloaded as a caption track only, no media.
 2. **Local transcription** — only when no caption matches the requested
    language (or `--force` is passed). Audio-only stream is downloaded,
    converted to mono 16 kHz PCM WAV, and fed to `faster-whisper` on the local
-   machine.
+   machine. A file on this computer has no YouTube captions, so it always takes
+   this path, and its sound is converted where the file lies instead of being
+   downloaded.
 
 It also does one thing that produces no text at all: **whole-file downloads**
 (`download`, or the page's download row) save the video as MP4 at a chosen
@@ -39,7 +41,7 @@ app/
 ├── interfaces/desktop/  the Qt window: the page's sections as native widgets
 ├── interfaces/launcher.py  writes the applications-menu entry that starts it
 ├── services/            orchestration; the only place where a workflow is decided
-│   ├── video_service.py         URL validation + live/availability guards + discovery
+│   ├── video_service.py         URL or file → validation + guards + discovery
 │   ├── subtitle_service.py      track selection, caption parsing, minimal cleanup
 │   ├── audio_service.py         job workspace, audio download, FFmpeg conversion
 │   ├── media_service.py         whole-file MP4/MP3 downloads: naming, disk, cleanup
@@ -48,11 +50,11 @@ app/
 │   └── export_service.py        format validation, filename, atomic multi-format write
 ├── adapters/            everything that talks to the outside world
 │   ├── ytdlp_adapter.py    metadata, caption/audio/media download, format mapping, error translation
-│   ├── ffmpeg_adapter.py   subprocess (no shell), conversion, error translation
+│   ├── ffmpeg_adapter.py   subprocess (no shell), conversion, FFprobe, error translation
 │   └── whisper_adapter.py  lazy faster-whisper import, device/compute selection
 ├── models/              frozen Pydantic contracts (VideoMetadata, SubtitleTrack, …)
 ├── exporters/           pure render functions: segments → text
-├── utils/               pure helpers (URL, time, language, filenames, Arabic text)
+├── utils/               pure helpers (URL, local path, time, language, filenames, Arabic text)
 └── core/                config, constants, exception hierarchy, retry, logging
 ```
 
@@ -126,6 +128,10 @@ Validated constraints that matter in practice:
 | `install-desktop` | no | one desktop entry and one icon | `interfaces/launcher.py` |
 | `update` | PyPI | the packages you pick | `PackageUpdater.check` → ask → `install` |
 
+Given a file on this computer instead of a link, `inspect`, `transcribe` and
+`prepare-audio` make no network call at all (beyond a first model download), and
+`extract` and `download` refuse it with a sentence saying what to run instead.
+
 Every command runs through `_run_with_config`, which does the same four things:
 load config, configure logging, run the action, and translate exceptions into a
 short user-facing message plus an exit code. When the action fails with
@@ -151,7 +157,10 @@ HTTP server, port, or token.
 - `window.py` builds the sections in the page's order and follows `app.js`:
   it polls a job every 700 ms, saves choices 600 ms after the last change, and
   offers a newer yt-dlp after a refusal. Slow calls run on a thread and answer
-  on the window's thread (`background.py`).
+  on the window's thread (`background.py`). Choose file opens the system's
+  chooser, and a file dropped anywhere on the window is taken (the text fields
+  refuse drops so they cannot swallow one); either way the path goes into the
+  field and is looked up where it lies, with no copy.
 - `application.py` owns the process:
 
 1. **One instance.** A `QLockFile` in `$XDG_RUNTIME_DIR` decides which copy is
@@ -183,14 +192,14 @@ It also declares `StartupWMClass=captionforge` and `SingleMainWindow=true`.
 |---|---|
 | 0 | success |
 | 1 | generic failure (incl. unexpected exceptions) |
-| 2 | invalid or unsupported YouTube URL |
+| 2 | invalid or unsupported YouTube URL, or a file that is missing, unreadable, or silent |
 | 3 | video unavailable or live stream |
 | 4 | metadata retrieval failure |
 | 130 | `KeyboardInterrupt` |
 
 ---
 
-## 5. The inspection path (shared by everything that touches YouTube)
+## 5. The inspection path (shared by everything that takes a link or a file)
 
 1. **`extract_youtube_video_id`** ([app/utils/url_utils.py](../app/utils/url_utils.py))
    — pure parsing, no network. Accepts `youtube.com`, `www`, `m`, `music`, and
@@ -214,6 +223,46 @@ It also declares `StartupWMClass=captionforge` and `SingleMainWindow=true`.
    is_upcoming}` → `LiveStreamNotSupportedError`; `availability in {private,
    subscriber_only, premium_only}` → `VideoUnavailableError`.
 7. **Selection** — handed to `SubtitleService.discover`.
+
+### Files on this computer
+
+`VideoService.inspect_all` first asks `local_media_path`
+([app/utils/local_media.py](../app/utils/local_media.py)) whether the input
+names a file. It accepts the forms systems copy paths in: plain, wrapped in
+quotes, `~/…`, `file://` URIs (percent-decoded, `localhost` allowed, any other
+host refused), Windows drive paths, `./` and `../`, a bare name with a media
+extension from `LOCAL_MEDIA_EXTENSIONS`, and any name that is an existing file.
+Anything with a URL scheme other than `file:` is a link. A path that names
+nothing is reported as a missing file, never as a malformed YouTube URL.
+
+Then, with no yt-dlp involved:
+
+1. `resolve_media_file` makes the path absolute (FFprobe would read a bare
+   `-name` as an option) and raises `LocalFileNotFoundError` for a missing path
+   or a folder, `UnreadableMediaFileError` for a file the user cannot read.
+2. `FFmpegAdapter.probe` runs FFprobe, found beside the configured FFmpeg
+   (`/opt/ff/ffmpeg` → `/opt/ff/ffprobe`), with `-show_format -show_streams`
+   as JSON. It reads the duration (the container's, else the longest stream's)
+   and whether any stream is audio. A file FFprobe rejects is
+   `UnreadableMediaFileError`; one without sound is `NoAudioStreamError`,
+   refused here rather than after a model has loaded.
+3. The result is a `VideoMetadata` with `local_path` set and `video_id` left
+   `None` (a model validator requires exactly one of the two), titled with the
+   file's stem so `lecture.mp4` exports `lecture.srt`, no caption tracks, and
+   empty `MediaOptions`, which hides the page's download row.
+
+All three errors are `LocalMediaError`s: HTTP 400 on the page, exit code 2 in
+the terminal.
+
+A browser never tells a page where a chosen or dropped file lives, so the page
+`PUT`s the file's bytes to `/api/uploads`
+([app/interfaces/web/uploads.py](../app/interfaces/web/uploads.py)), which
+writes them to `<temp_directory>/uploads/<uuid>/<name>` (mode `0o700`, name
+sanitised, disk space checked first) and answers with that absolute path. The
+page then looks the path up like a pasted one. A newer copy replaces older ones
+unless an unfinished job still reads one; every copy goes when the server stops,
+and copies older than a day are swept at start-up, after a crash. Pasting the
+path skips the copy, and the desktop window never makes one.
 
 ### Track selection rules
 
@@ -288,7 +337,7 @@ inspect (5%)
   └── otherwise
         prepare audio (10% → 25%)
           ├── create job dir + disk check
-          ├── yt-dlp bestaudio download
+          ├── yt-dlp bestaudio download   (a file skips this)
           └── ffmpeg → mono 16 kHz PCM WAV
         load model (30%)
         transcribe (40% → 85%)
@@ -312,7 +361,8 @@ slow `min(84, 40 + segment_index)` crawl when the duration is unknown.
   plus the WAV output. Unknown duration falls back to 600 s.
 - `yt-dlp` with `format: "bestaudio"`. A "requested format is not available"
   error becomes `AudioFormatUnavailableError`; everything else becomes a
-  retryable `AudioDownloadError`.
+  retryable `AudioDownloadError`. A file on this computer skips the download:
+  FFmpeg reads it in place, and it is never moved, copied, or removed.
 - FFmpeg is invoked as an argument list, never through a shell:
   `-y -i <src> -vn -acodec pcm_s16le -ar 16000 -ac 1 <dst>`. The output is
   verified to exist and be non-empty afterwards. Note that `audio_format` only
@@ -682,9 +732,11 @@ Offline testing is possible because every external boundary is injectable:
 
 ## 15. Known limitations and rough edges
 
-Deliberate limits: individual non-live videos only; no playlists, channels,
-live streams, translation, diarization, cookie/authenticated access, or GUI; no
-aggressive spelling or grammar rewriting. Downloads offer only the heights a
+Deliberate limits: individual non-live videos or single files only; no
+playlists, channels, folders, live streams, translation, diarization, or
+cookie/authenticated access; no aggressive spelling or grammar rewriting.
+Subtitle tracks embedded in a file (an MKV's, say) are not read: a file is
+always transcribed. Downloads offer only the heights a
 video publishes, and never re-encode to reach a height it does not.
 
 Rough edges in the current code, worth knowing:
@@ -700,6 +752,6 @@ Rough edges in the current code, worth knowing:
   "pcm_s16le"` branch; `audio_format` only affects the file extension.
 - `configure_logging`'s docstring mentions console and file handlers, but only
   the file handler is registered.
-- The `clean` command builds a placeholder `VideoMetadata` with the synthetic ID
-  `localclean1` so it can reuse `ExportService`; the file is then renamed to the
-  requested destination.
+- The `clean` command builds a `VideoMetadata` for the input file so it can
+  reuse `ExportService`; the result is then renamed to the requested
+  destination.

@@ -54,7 +54,13 @@ class MediaService:
     def options(self, url: str) -> tuple[VideoMetadata, MediaOptions]:
         """Report the qualities this video actually publishes."""
         inspection = self._video_service.inspect_all(url, self._config.default_language)
-        return inspection.discovery.video, inspection.media
+        video = inspection.discovery.video
+        if video.is_local:
+            raise MediaFormatUnavailableError(
+                "Downloads are for YouTube videos. That file is already on this "
+                "computer."
+            )
+        return video, inspection.media
 
     def download(
         self,
@@ -80,6 +86,8 @@ class MediaService:
             )
         if stop():
             raise MediaDownloadCancelledError("The download was cancelled.")
+        video_id = video.video_id
+        assert video_id is not None
 
         directory = ensure_output_directory(
             output_directory or self._config.default_output_folder
@@ -93,11 +101,9 @@ class MediaService:
                     int((variant.estimated_bytes or 0) * SIZE_SAFETY_FACTOR),
                 ),
             )
-            log.info(
-                "Downloading media video_id={} variant={}", video.video_id, variant.key
-            )
+            log.info("Downloading media video_id={} variant={}", video_id, variant.key)
             produced = self._ytdlp.download_media(
-                video.video_id,
+                video_id,
                 workspace,
                 variant,
                 progress_callback=notify,
@@ -136,7 +142,7 @@ class MediaService:
         # Trust what FFmpeg produced over what was requested: a video with no
         # separate MP4 stream can come back as the container yt-dlp had.
         extension = produced.suffix.lower().lstrip(".") or variant.extension
-        stem = sanitize_filename(video.title, fallback=video.video_id)
+        stem = sanitize_filename(video.title, fallback=video.video_id or "video")
         suffix = "" if variant.is_audio else f" [{variant.label}]"
         stem = f"{stem}{suffix}"
         if not overwrite:

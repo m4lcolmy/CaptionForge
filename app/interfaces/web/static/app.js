@@ -20,6 +20,7 @@
   const ui = {
     meta: el("meta"), form: el("source-form"), url: el("url"),
     inspect: el("inspect-btn"), hint: el("hint"),
+    choose: el("choose-btn"), fileInput: el("file-input"),
     alert: el("alert"), alertTitle: el("alert-title"), alertBody: el("alert-body"),
     updates: el("updates"), updatesLabel: el("updates-label"),
     updateList: el("update-list"), updateActions: el("update-actions"),
@@ -52,6 +53,10 @@
     preferences: {},
     saveTimer: null,
     updateCheck: 0,
+    // A file the page handed over: the name shown in the field, and the path
+    // of CaptionForge's copy, which is what actually gets looked up.
+    upload: null,
+    copying: null,
   };
 
   /* ---------- token ---------- */
@@ -115,6 +120,7 @@
   function busy(isBusy) {
     state.running = isBusy;
     ui.inspect.disabled = isBusy;
+    ui.choose.disabled = isBusy;
     ui.run.disabled = isBusy;
     // One click starts a download, so every other one has to stop working
     // while a job runs: two writes to the output folder at once help nobody.
@@ -161,6 +167,8 @@
       return;
     }
     ui.meta.textContent = `v${state.defaults.version} · ${state.defaults.output_directory}`;
+    const extensions = state.defaults.local_media_extensions || [];
+    ui.fileInput.accept = ["audio/*", "video/*", ...extensions.map((ext) => `.${ext}`)].join(",");
     state.preferences = state.defaults.preferences || {};
     applyPreferences();
     watchForChanges();
@@ -341,10 +349,25 @@
 
   /* ---------- inspection ---------- */
 
-  ui.form.addEventListener("submit", async (event) => {
+  ui.form.addEventListener("submit", (event) => {
     event.preventDefault();
-    const url = ui.url.value.trim();
-    if (!url) return;
+    lookUp();
+  });
+
+  function sourceValue() {
+    const typed = ui.url.value.trim();
+    return state.upload && typed === state.upload.name ? state.upload.path : typed;
+  }
+
+  function looksLocal(text) {
+    // Only picks the alert's wording; the server decides what the text is.
+    return text === (state.upload && state.upload.path) ||
+      /^(\/|~|\.{1,2}[\\/]|[A-Za-z]:[\\/]|\\\\|file:)/i.test(text);
+  }
+
+  async function lookUp() {
+    const url = sourceValue();
+    if (!url || state.running) return;
     clearAlert();
     stopPolling();
     ui.results.hidden = true;
@@ -365,7 +388,10 @@
       ui.video.hidden = true;
       ui.media.hidden = true;
       ui.tracks.hidden = true;
-      showAlert("Could not read that video", error.message);
+      showAlert(
+        looksLocal(url) ? "Could not read that file" : "Could not read that video",
+        error.message
+      );
       if (error.payload && error.payload.update_may_help) {
         offerUpdates({ refused: true });
       }
@@ -373,7 +399,119 @@
       busy(false);
       ui.inspect.textContent = "Look up";
     }
+  }
+
+  /* ---------- files from this computer ---------- */
+
+  ui.choose.addEventListener("click", () => {
+    if (state.running) return;
+    ui.fileInput.value = "";
+    ui.fileInput.click();
   });
+
+  ui.fileInput.addEventListener("change", () => {
+    const file = ui.fileInput.files && ui.fileInput.files[0];
+    if (file) takeFile(file);
+  });
+
+  // Dropping a file anywhere on the page takes it, and never navigates away
+  // to show the file instead.
+  let dragDepth = 0;
+  const carriesFiles = (event) =>
+    Boolean(event.dataTransfer) && [...event.dataTransfer.types].includes("Files");
+
+  document.addEventListener("dragenter", (event) => {
+    if (!carriesFiles(event)) return;
+    event.preventDefault();
+    dragDepth += 1;
+    ui.form.classList.toggle("dropping", !state.running);
+  });
+  document.addEventListener("dragover", (event) => {
+    if (!carriesFiles(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = state.running ? "none" : "copy";
+  });
+  document.addEventListener("dragleave", (event) => {
+    if (!carriesFiles(event)) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth) ui.form.classList.remove("dropping");
+  });
+  document.addEventListener("drop", (event) => {
+    if (!carriesFiles(event)) return;
+    event.preventDefault();
+    dragDepth = 0;
+    ui.form.classList.remove("dropping");
+    const file = event.dataTransfer.files[0];
+    if (file && !state.running) takeFile(file);
+  });
+
+  async function takeFile(file) {
+    clearAlert();
+    stopPolling();
+    ui.results.hidden = true;
+    busy(true);
+    const stage = `Copying ${file.name}`;
+    setProgress(stage, 0);
+    ui.cancel.disabled = false;
+    ui.progress.hidden = false;
+    let stored;
+    try {
+      stored = await sendFile(file, (fraction) => setProgress(stage, fraction * 100));
+    } catch (error) {
+      ui.progress.hidden = true;
+      busy(false);
+      if (error.cancelled) showAlert("Cancelled", "Nothing was copied.");
+      else showAlert("Could not read that file", error.message);
+      return;
+    }
+    ui.progress.hidden = true;
+    busy(false);
+    state.upload = { name: file.name, path: stored.path };
+    ui.url.value = file.name;
+    lookUp();
+  }
+
+  function sendFile(file, onProgress) {
+    // XMLHttpRequest, not fetch: only it reports how much has been sent.
+    return new Promise((resolve, reject) => {
+      const request = new XMLHttpRequest();
+      state.copying = request;
+      request.open("PUT", "/api/uploads");
+      request.setRequestHeader("X-CaptionForge-Token", state.token);
+      request.setRequestHeader("X-CaptionForge-Filename", encodeURIComponent(file.name));
+      request.upload.addEventListener("progress", (event) => {
+        if (event.lengthComputable) onProgress(event.loaded / event.total);
+      });
+      request.addEventListener("load", () => {
+        let payload = null;
+        try {
+          payload = JSON.parse(request.responseText);
+        } catch {
+          payload = null;
+        }
+        if (request.status >= 200 && request.status < 300 && payload) {
+          resolve(payload);
+          return;
+        }
+        const failure = new Error(
+          (payload && payload.error) || "CaptionForge could not take that file."
+        );
+        failure.payload = payload;
+        reject(failure);
+      });
+      request.addEventListener("error", () => {
+        reject(new Error("The file could not be handed to CaptionForge."));
+      });
+      request.addEventListener("abort", () => {
+        const cancelled = new Error("Cancelled");
+        cancelled.cancelled = true;
+        reject(cancelled);
+      });
+      request.send(file);
+    }).finally(() => {
+      state.copying = null;
+    });
+  }
 
   function renderInspection(result) {
     const video = result.video;
@@ -426,7 +564,13 @@
     ui.selection.textContent = result.selected_track
       ? `Will export the highlighted track (${result.selection_reason || "preferred match"}).`
       : "No matching track, so the audio will be transcribed on this computer.";
-    ui.tracks.hidden = false;
+    // A file has no published tracks to list, and is always transcribed, so
+    // the button says so and the two caption-track options step aside.
+    const local = Boolean(video.local_path);
+    ui.tracks.hidden = local;
+    ui.force.closest("label").hidden = local;
+    ui.allowTranslated.closest("label").hidden = local;
+    ui.run.textContent = local ? "Transcribe" : "Get captions";
     ui.controls.hidden = false;
   }
 
@@ -479,7 +623,7 @@
       const job = await api("/api/media", {
         method: "POST",
         body: JSON.stringify({
-          url: ui.url.value.trim(),
+          url: sourceValue(),
           quality: variant.key,
           overwrite: ui.overwrite.checked,
         }),
@@ -539,7 +683,7 @@
       const job = await api("/api/jobs", {
         method: "POST",
         body: JSON.stringify({
-          url: ui.url.value.trim(),
+          url: sourceValue(),
           language: ui.language.value.trim() || null,
           formats: [...state.chosenFormats],
           model: chosenModel(),
@@ -565,6 +709,10 @@
   });
 
   ui.cancel.addEventListener("click", async () => {
+    if (state.copying) {
+      state.copying.abort();
+      return;
+    }
     if (!state.jobId) return;
     ui.cancel.disabled = true;
     ui.stage.textContent = "Cancelling…";

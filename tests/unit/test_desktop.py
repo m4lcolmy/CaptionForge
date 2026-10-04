@@ -20,9 +20,25 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6.QtWidgets")
 
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QRect, Qt  # noqa: E402
-from PySide6.QtGui import QColor, QImage, QPalette  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtCore import (  # noqa: E402
+    QBuffer,
+    QByteArray,
+    QIODevice,
+    QMimeData,
+    QPoint,
+    QPointF,
+    QRect,
+    Qt,
+    QUrl,
+)
+from PySide6.QtGui import (  # noqa: E402
+    QColor,
+    QDragEnterEvent,
+    QDropEvent,
+    QImage,
+    QPalette,
+)
+from PySide6.QtWidgets import QApplication, QLineEdit  # noqa: E402
 
 from app.adapters.package_updater import (  # noqa: E402
     PACKAGES,
@@ -34,12 +50,14 @@ from app.core.config import Config  # noqa: E402
 from app.core.exceptions import (  # noqa: E402
     ConfigurationError,
     ExtractorRefusedError,
+    LocalFileNotFoundError,
 )
 from app.interfaces import cli, desktop, launcher  # noqa: E402
 from app.interfaces.desktop import application as desktop_app  # noqa: E402
 from app.interfaces.desktop import theme  # noqa: E402
 from app.interfaces.desktop.widgets import Chip, FileRow  # noqa: E402
 from app.interfaces.desktop.window import (  # noqa: E402
+    MEDIA_FILE_FILTER,
     MainWindow,
     Services,
     format_duration,
@@ -188,6 +206,52 @@ def inspection(title: str = "How captions are made") -> VideoInspection:
     return VideoInspection(discovery=discovery, media=media)
 
 
+def local_inspection(path: Path) -> VideoInspection:
+    """A file on this computer: no tracks, nothing to download."""
+    video = VideoMetadata(
+        title=path.stem,
+        duration_seconds=95,
+        webpage_url=path.as_uri(),
+        original_url=str(path),
+        local_path=path,
+    )
+    return VideoInspection(
+        discovery=SubtitleDiscoveryResult(video=video, preferred_language="ar"),
+        media=MediaOptions(),
+    )
+
+
+def carrying(*urls: QUrl) -> QMimeData:
+    """What a file manager hands over when something is dragged out of it."""
+    mime = QMimeData()
+    mime.setUrls(list(urls))
+    return mime
+
+
+def drag_over(window: MainWindow, mime: QMimeData) -> QDragEnterEvent:
+    event = QDragEnterEvent(
+        QPoint(40, 40),
+        Qt.DropAction.CopyAction,
+        mime,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(window, event)
+    return event
+
+
+def drop_on(window: MainWindow, mime: QMimeData) -> QDropEvent:
+    event = QDropEvent(
+        QPointF(40, 40),
+        Qt.DropAction.CopyAction,
+        mime,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(window, event)
+    return event
+
+
 def png_bytes() -> bytes:
     """A real picture, so the thumbnail has something to decode."""
     image = QImage(32, 18, QImage.Format.Format_RGB32)
@@ -250,6 +314,7 @@ def make_window(
             cuda=overrides.pop("cuda", lambda: CudaStatus(True, True, ())),
             fetch=overrides.pop("fetch", lambda url: png_bytes()),
             open_path=lambda path: opened.append(path) or True,
+            choose_file=overrides.pop("choose_file", lambda parent, folder: None),
         )
         window = MainWindow(
             overrides.pop("config", Config()),
@@ -794,3 +859,154 @@ def test_chips_measure_bold_so_picking_never_reflows(qt_app: QApplication) -> No
     chip.set_picked(True)
 
     assert chip.sizeHint() == before
+
+
+# ---------- files from this computer ----------
+
+
+def test_a_chosen_file_is_looked_up_straight_away(
+    make_window: Callable[..., MainWindow], tmp_path: Path
+) -> None:
+    """Choosing is the whole request, and the file is read where it lies."""
+    source = tmp_path / "talk.mp3"
+    folders: list[str] = []
+    seen: list[str] = []
+
+    def choose(_parent: object, folder: str) -> str:
+        folders.append(folder)
+        return str(source)
+
+    window = make_window(
+        choose_file=choose,
+        inspect=lambda url, language, allow: (
+            seen.append(url) or local_inspection(source)
+        ),
+    )
+
+    window.choose_button.click()
+    wait_until(lambda: not window.controls.isHidden())
+
+    assert folders == [str(Path.home())]
+    assert seen == [str(source)]
+    assert window.url.text() == str(source)
+    assert window.title.plain() == "talk"
+    assert window.byline.plain() == "1:35"
+    # A file has no tracks and is always transcribed, and the window says so.
+    assert window.run_button.text() == "Transcribe"
+    assert window.tracks.isHidden() and window.media.isHidden()
+    assert window.force.isHidden() and window.allow_translated.isHidden()
+
+    # The next choice starts where the last one was found.
+    window.choose_button.click()
+    assert folders[-1] == str(tmp_path)
+
+
+def test_closing_the_chooser_changes_nothing(
+    make_window: Callable[..., MainWindow],
+) -> None:
+    seen: list[str] = []
+    window = make_window(
+        inspect=lambda url, language, allow: seen.append(url) or inspection()
+    )
+    window.choose_button.click()
+    QApplication.processEvents()
+    assert seen == []
+    assert window.url.text() == ""
+    assert window.controls.isHidden()
+
+
+def test_a_link_after_a_file_brings_the_caption_parts_back(
+    make_window: Callable[..., MainWindow], tmp_path: Path
+) -> None:
+    source = tmp_path / "talk.mp3"
+    answers = iter([local_inspection(source), inspection()])
+    window = make_window(inspect=lambda url, language, allow: next(answers))
+
+    looked_up(window, str(source))
+    assert window.run_button.text() == "Transcribe"
+    window.controls.hide()
+    looked_up(window)
+
+    assert window.run_button.text() == "Get captions"
+    assert not window.tracks.isHidden()
+    assert not window.force.isHidden() and not window.allow_translated.isHidden()
+
+
+def test_a_file_dropped_on_the_window_is_looked_up(
+    make_window: Callable[..., MainWindow], tmp_path: Path
+) -> None:
+    source = tmp_path / "محاضرة.mp4"
+    seen: list[str] = []
+    window = make_window(
+        inspect=lambda url, language, allow: (
+            seen.append(url) or local_inspection(source)
+        )
+    )
+    mime = carrying(QUrl.fromLocalFile(str(source)))
+
+    assert drag_over(window, mime).isAccepted()
+    # The field is marked as where the file will land.
+    assert window.url.property("dropping") == "true"
+    drop_on(window, mime)
+    wait_until(lambda: not window.controls.isHidden())
+
+    assert window.url.property("dropping") == "false"
+    assert seen == [str(source)]
+
+
+def test_only_files_on_this_computer_can_be_dropped(
+    make_window: Callable[..., MainWindow],
+) -> None:
+    window = make_window()
+    link = carrying(QUrl("https://youtu.be/qJFbKl6RjLU"))
+    assert not drag_over(window, link).isAccepted()
+    assert window.url.property("dropping") != "true"
+
+
+def test_nothing_is_dropped_while_a_job_runs(
+    make_window: Callable[..., MainWindow], tmp_path: Path
+) -> None:
+    seen: list[str] = []
+    window = looked_up(
+        make_window(
+            inspect=lambda url, language, allow: seen.append(url) or inspection()
+        )
+    )
+    window.run()
+    mime = carrying(QUrl.fromLocalFile(str(tmp_path / "talk.mp4")))
+
+    assert not drag_over(window, mime).isAccepted()
+    drop_on(window, mime)
+    QApplication.processEvents()
+
+    assert seen == [URL]
+    assert window.url.text() == URL
+
+
+def test_the_fields_leave_dropped_files_to_the_window(
+    make_window: Callable[..., MainWindow],
+) -> None:
+    """Otherwise a field would swallow the drop as the text of its address."""
+    window = make_window()
+    assert window.acceptDrops()
+    assert not any(field.acceptDrops() for field in window.findChildren(QLineEdit))
+
+
+def test_a_file_that_cannot_be_read_says_file(
+    make_window: Callable[..., MainWindow], tmp_path: Path
+) -> None:
+    def inspect(url: str, language: str, allow: bool) -> VideoInspection:
+        raise LocalFileNotFoundError(f"No file was found at {url}.")
+
+    window = make_window(inspect=inspect)
+    window.take_file(tmp_path / "gone.mp4")
+    wait_until(lambda: not window.alert.isHidden())
+
+    assert window.alert_title.text() == "COULD NOT READ THAT FILE"
+    assert window.alert_body.plain().startswith("No file was found at")
+
+
+def test_the_file_chooser_lists_media_in_either_case() -> None:
+    assert "*.mp4" in MEDIA_FILE_FILTER and "*.MP4" in MEDIA_FILE_FILTER
+    assert "*.opus" in MEDIA_FILE_FILTER
+    assert MEDIA_FILE_FILTER.endswith(";;All files (*)")

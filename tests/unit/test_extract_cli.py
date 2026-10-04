@@ -27,7 +27,7 @@ class StubVideoService:
 
     result: SubtitleDiscoveryResult
 
-    def __init__(self, adapter: object, subtitle_service: object) -> None:
+    def __init__(self, adapter: object, subtitle_service: object, *_: object) -> None:
         pass
 
     def inspect(

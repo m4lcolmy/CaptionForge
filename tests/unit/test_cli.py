@@ -85,7 +85,9 @@ def test_valid_mocked_inspection(
         selection_reason="Selected manual Arabic caption using an exact match.",
     )
     monkeypatch.setattr(
-        cli, "_create_video_service", lambda: StubVideoService(result_model)
+        cli,
+        "_create_video_service",
+        lambda _config=None: StubVideoService(result_model),
     )
 
     result = runner.invoke(cli.app, ["inspect", VIDEO_URL])
@@ -105,7 +107,9 @@ def test_json_output_is_clean_and_valid(
         preferred_language="ar",
     )
     monkeypatch.setattr(
-        cli, "_create_video_service", lambda: StubVideoService(result_model)
+        cli,
+        "_create_video_service",
+        lambda _config=None: StubVideoService(result_model),
     )
 
     result = runner.invoke(cli.app, ["inspect", VIDEO_URL, "--json"])
@@ -124,7 +128,7 @@ def test_adapter_failure_has_metadata_exit_code(
     monkeypatch.setattr(
         cli,
         "_create_video_service",
-        lambda: StubVideoService(
+        lambda _config=None: StubVideoService(
             error=MetadataRetrievalError("Metadata unavailable", details="secret")
         ),
     )
