@@ -123,9 +123,20 @@ class FFmpegAdapter:
         sample_rate: int = 16000,
         channels: int = 1,
         audio_format: str = "wav",
+        bitrate_kbps: int | None = None,
     ) -> list[str]:
-        """Build a PCM WAV conversion command."""
-        codec = "pcm_s16le" if audio_format.lower() == "wav" else "pcm_s16le"
+        """Build a conversion command: PCM for WAV, Opus for an upload.
+
+        Whisper reads 16-bit PCM WAV. Deepgram is sent Ogg Opus instead, which
+        is about a fifth of the size and loses nothing a recogniser needs.
+        """
+        codec = _CODECS.get(audio_format.lower(), "pcm_s16le")
+        rate = ["-b:a", f"{bitrate_kbps}k"] if bitrate_kbps else []
+        if rate and codec == "libopus":
+            # Opus's free VBR ran 27% over the rate on a steady tone, which
+            # would make the upload size the interfaces show a broken promise.
+            # Constrained VBR stays within about 2% of it.
+            rate += ["-vbr", "constrained"]
         return [
             self.executable,
             "-y",
@@ -134,6 +145,7 @@ class FFmpegAdapter:
             "-vn",
             "-acodec",
             codec,
+            *rate,
             "-ar",
             str(sample_rate),
             "-ac",
@@ -149,6 +161,7 @@ class FFmpegAdapter:
         sample_rate: int = 16000,
         channels: int = 1,
         audio_format: str = "wav",
+        bitrate_kbps: int | None = None,
     ) -> Path:
         """Convert audio and verify that FFmpeg produced a non-empty file."""
         command = self.build_conversion_command(
@@ -157,6 +170,7 @@ class FFmpegAdapter:
             sample_rate=sample_rate,
             channels=channels,
             audio_format=audio_format,
+            bitrate_kbps=bitrate_kbps,
         )
         self._execute(command, conversion=True)
         if not destination.is_file() or destination.stat().st_size == 0:
@@ -190,6 +204,16 @@ class FFmpegAdapter:
             raise AudioConversionError(
                 "FFmpeg could not be started.", details=str(exc)
             ) from exc
+
+
+# Container name to the encoder that fills it. Anything else gets PCM, which
+# is what every caller before Deepgram asked for.
+_CODECS = {
+    "wav": "pcm_s16le",
+    "flac": "flac",
+    "ogg": "libopus",
+    "opus": "libopus",
+}
 
 
 def _seconds(value: Any) -> float | None:

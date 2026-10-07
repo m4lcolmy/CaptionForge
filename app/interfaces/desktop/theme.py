@@ -236,6 +236,13 @@ def indicator_svgs(palette: Palette) -> dict[str, str]:
             f'stroke="{EMERALD}" stroke-width="2"/>'
             f'<circle cx="7.5" cy="7.5" r="3.6" fill="{EMERALD}"/>'
         ),
+        # The page draws its dropdown chevron from two gradients in --muted.
+        "chevron": (
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 6" '
+            'width="10" height="6"><path d="M1 1 5 5 9 1" fill="none" '
+            f'stroke="{palette.muted}" stroke-width="1.6" '
+            'stroke-linecap="round" stroke-linejoin="round"/></svg>'
+        ),
     }
 
 
@@ -280,6 +287,7 @@ QLabel[role="label"] {{ color: {p.muted}; }}
 QLabel[role="note"] {{ color: {p.muted}; font-size: 14px; }}
 QLabel[role="help"] {{ color: {p.muted}; font-size: 13px; }}
 QLabel[role="title"] {{ font-size: 17px; font-weight: 600; }}
+QLabel#key-saved-text {{ font-family: "{mono}"; font-size: 13px; }}
 
 /* ---- inputs ---- */
 
@@ -291,6 +299,25 @@ QLineEdit {{
 QLineEdit:focus {{ border: 2px solid {EMERALD}; padding: 9px 12px; }}
 QLineEdit[dropping="true"] {{
   border: 1px dashed {EMERALD}; padding: 10px 13px; background: {p.sunk};
+}}
+QLineEdit#deepgram-key {{ font-family: "{mono}"; }}
+
+QComboBox {{
+  font-size: 15px; color: {p.ink}; background: {p.surface};
+  border: 1px solid {p.line}; border-radius: {RADIUS}px;
+  padding: 10px 38px 10px 13px;
+}}
+QComboBox:hover {{ border-color: {EMERALD}; }}
+QComboBox:focus {{ border: 2px solid {EMERALD}; padding: 9px 37px 9px 12px; }}
+QComboBox::drop-down {{
+  subcontrol-origin: padding; subcontrol-position: center right;
+  width: 38px; border: none; background: transparent;
+}}
+QComboBox::down-arrow {{ image: url("{marks['chevron']}"); width: 10px; height: 6px; }}
+QComboBox QAbstractItemView {{
+  background: {p.surface}; color: {p.ink}; border: 1px solid {p.line};
+  border-radius: 6px; padding: 4px; outline: none;
+  selection-background-color: {p.sunk}; selection-color: {p.ink};
 }}
 
 /* ---- buttons ---- */
@@ -318,6 +345,7 @@ QPushButton[variant="quiet"] {{
 }}
 QPushButton[variant="quiet"]:enabled:hover,
 QPushButton[variant="quiet"]:focus {{ border-color: {p.bad}; color: {p.bad}; }}
+QPushButton[variant="quiet"][size="small"] {{ padding: 3px 10px; font-size: 13px; }}
 
 QPushButton[variant="summary"] {{
   background: transparent; border: none; color: {p.muted};

@@ -122,7 +122,7 @@ h3 { margin: 0; }
 
 /* ---- inputs ---- */
 
-input[type="text"], input[type="url"] {
+input[type="text"], input[type="url"], input[type="password"], select {
   font: inherit;
   color: var(--ink);
   background: var(--surface);
@@ -135,7 +135,23 @@ input[type="text"], input[type="url"] {
 
 input::placeholder { color: var(--muted); }
 
+/* A field-shaped dropdown: the chevron is two gradients in --muted, so it
+   follows the colour scheme without an image. */
+select {
+  appearance: none;
+  cursor: pointer;
+  padding-right: 2.4rem;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 1.2rem) 52%, calc(100% - 0.88rem) 52%;
+  background-size: 0.32rem 0.32rem;
+  background-repeat: no-repeat;
+}
+select:hover { border-color: var(--emerald); }
+
 input:focus-visible,
+select:focus-visible,
 button:focus-visible,
 summary:focus-visible,
 a:focus-visible {
@@ -260,7 +276,19 @@ button.chip.picked[disabled] { opacity: 1; cursor: progress; }
 
 .field { min-width: 0; }
 .field.grow { flex: 1; }
-.controls > .options, .controls > .btn-go { flex-basis: 100%; }
+.controls > .options, .controls > .engine, .controls > .btn-go { flex-basis: 100%; }
+
+/* ---- transcription: engine, model, key, and the one override ---- */
+
+.engine { display: flex; flex-direction: column; gap: 0.6rem; }
+.engine .help { margin: 0; }
+
+.key-row { display: flex; gap: 0.6rem; }
+.key-row input { flex: 1; font-family: var(--mono); }
+
+.key-saved { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem; }
+.key-saved .note { font-family: var(--mono); font-size: 0.8rem; }
+.key-saved .btn-quiet { padding: 0.2rem 0.65rem; font-size: 0.8rem; }
 
 .options summary {
   font-size: 0.8rem;
@@ -326,7 +354,6 @@ button.chip.picked[disabled] { opacity: 1; cursor: progress; }
 .radio b { font-weight: 600; font-size: 0.9rem; }
 .radio em { font-style: normal; font-size: 0.79rem; color: var(--muted); }
 
-#model-custom { margin-top: 0.5rem; }
 
 .field-block { display: flex; flex-direction: column; }
 
@@ -411,6 +438,6 @@ button.chip.picked[disabled] { opacity: 1; cursor: progress; }
 
 @media (max-width: 33rem) {
   main { padding: 1.75rem 1.1rem 4rem; gap: 1.4rem; }
-  .source { flex-direction: column; }
+  .source, .key-row { flex-direction: column; }
   .radio { padding: 0.5rem 0.6rem; }
 }

@@ -15,7 +15,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from app.core.config import Config
-from app.core.constants import SUPPORTED_OUTPUT_FORMATS
+from app.core.constants import SUPPORTED_OUTPUT_FORMATS, TRANSCRIPTION_ENGINES
 from app.core.logging_config import get_logger
 
 PREFERENCES_FILE_NAME = "web-preferences.json"
@@ -28,7 +28,11 @@ class WebPreferences(BaseModel):
 
     language: str | None = Field(default=None, max_length=32)
     formats: tuple[str, ...] = ()
+    engine: str | None = None
+    # One remembered model per engine, so switching back and forth never
+    # loses the other one's choice.
     model: str | None = Field(default=None, max_length=256)
+    deepgram_model: str | None = Field(default=None, max_length=256)
     device: str | None = None
     prompt: str | None = Field(default=None, max_length=2048)
     force: bool = False
@@ -43,6 +47,17 @@ class WebPreferences(BaseModel):
     def validate_formats(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         """Drop formats this build no longer supports rather than failing."""
         return tuple(item for item in value if item in SUPPORTED_OUTPUT_FORMATS)
+
+    @field_validator("engine")
+    @classmethod
+    def validate_engine(cls, value: str | None) -> str | None:
+        """Accept only the engines the transcription service knows."""
+        if value is None:
+            return None
+        normalized = value.lower()
+        if normalized not in TRANSCRIPTION_ENGINES:
+            raise ValueError("engine must be whisper or deepgram")
+        return normalized
 
     @field_validator("device")
     @classmethod
@@ -101,7 +116,9 @@ def resolve(preferences: WebPreferences, config: Config) -> dict[str, Any]:
     return {
         "language": preferences.language or config.default_language,
         "formats": list(preferences.formats) or list(config.default_output_formats[:1]),
+        "engine": preferences.engine or config.transcription_engine,
         "model": preferences.model or config.default_whisper_model,
+        "deepgram_model": preferences.deepgram_model or config.deepgram_model,
         "device": preferences.device or config.whisper_device,
         "prompt": preferences.prompt or "",
         "force": preferences.force,

@@ -1,18 +1,28 @@
-"""Caption-first orchestration for local Whisper transcription."""
+"""Caption-first orchestration, transcribing with Whisper or Deepgram."""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+from app.adapters.deepgram_adapter import DeepgramAdapter, keyterms_from
 from app.adapters.whisper_adapter import WhisperAdapter
 from app.adapters.ytdlp_adapter import YtDlpAdapter
 from app.core.config import Config
+from app.core.constants import (
+    DEEPGRAM_UPLOAD_BITRATE_KBPS,
+    DEEPGRAM_UPLOAD_FORMAT,
+    TRANSCRIPTION_ENGINES,
+)
+from app.core.deepgram_key import DeepgramKey, load_key
 from app.core.exceptions import (
     CaptionForgeError,
     CleanupError,
+    DeepgramKeyMissingError,
     TranscriptionCancelledError,
+    ValidationError,
 )
 from app.core.logging_config import get_logger
 from app.core.retry import retry_call
@@ -31,6 +41,7 @@ from app.utils.local_media import local_media_path
 
 ProgressCallback = Callable[[str, float | None], None]
 CancelCallback = Callable[[], bool]
+KeyLoader = Callable[[], DeepgramKey | None]
 
 
 @dataclass(frozen=True)
@@ -45,7 +56,11 @@ class TranscriptionWorkflowResult:
 
 
 class TranscriptionService:
-    """Choose captions first, otherwise prepare audio and run Whisper."""
+    """Choose captions first, otherwise prepare audio and transcribe it.
+
+    Whisper transcribes on this computer. Deepgram, when it is picked, is sent
+    a compressed copy of the audio, and nothing else leaves the computer.
+    """
 
     def __init__(
         self,
@@ -56,6 +71,9 @@ class TranscriptionService:
         whisper: WhisperAdapter,
         export_service: ExportService,
         config: Config,
+        *,
+        deepgram: DeepgramAdapter | None = None,
+        deepgram_key: KeyLoader = load_key,
     ) -> None:
         self._video_service = video_service
         self._ytdlp = ytdlp
@@ -67,12 +85,15 @@ class TranscriptionService:
         self._resilient = ResilientTranscriber(whisper)
         self._export_service = export_service
         self._config = config
+        self._deepgram = deepgram or DeepgramAdapter()
+        self._deepgram_key = deepgram_key
 
     def process(
         self,
         url: str,
         *,
         language: str | None = None,
+        engine: str | None = None,
         model_name: str | None = None,
         device: str | None = None,
         compute_type: str | None = None,
@@ -91,10 +112,18 @@ class TranscriptionService:
         """Inspect, select the appropriate source, transcribe if needed, and export.
 
         ``url`` is a YouTube link or a video or audio file on this computer. A
-        file has no caption tracks, so it always goes to Whisper.
+        file has no caption tracks, so it is always transcribed. ``engine`` is
+        "whisper" or "deepgram"; ``model_name`` names a model of that engine.
         """
         notify = progress or (lambda _message, _percent: None)
         is_cancelled = cancelled or (lambda: False)
+        selected_engine = (engine or self._config.transcription_engine).lower()
+        if selected_engine not in TRANSCRIPTION_ENGINES:
+            raise ValidationError(
+                f"Unknown transcription engine '{engine}'. Choose "
+                f"{' or '.join(sorted(TRANSCRIPTION_ENGINES))}."
+            )
+        use_deepgram = selected_engine == "deepgram"
         selected_language = language or self._config.whisper_language
         inspection_language = selected_language or self._config.default_language
         job = Job(source_url=url, language=inspection_language)
@@ -146,6 +175,9 @@ class TranscriptionService:
                     used_existing_captions=True,
                 )
 
+            # Checked before any audio is fetched: finding out after a long
+            # download that the upload cannot happen wastes the person's time.
+            key = self._require_deepgram_key() if use_deepgram else None
             job.status = JobStatus.PREPARING_AUDIO
             notify("Preparing audio", 10.0)
             audio_path = self._audio_service.prepare(
@@ -158,6 +190,8 @@ class TranscriptionService:
                     message,
                     None if percent is None else 10.0 + percent * 0.15,
                 ),
+                audio_format=DEEPGRAM_UPLOAD_FORMAT if use_deepgram else None,
+                bitrate_kbps=DEEPGRAM_UPLOAD_BITRATE_KBPS if use_deepgram else None,
             )
             job.prepared_audio_path = audio_path
             self._check_cancelled(is_cancelled)
@@ -173,52 +207,41 @@ class TranscriptionService:
                     job.progress_percent = percent
                 notify(message, percent)
 
-            selected_model = model_name or self._config.default_whisper_model
-            selected_device = device or self._config.whisper_device
-            log.info(
-                "Transcription selected_method=whisper source={} model={} device={}",
-                discovery.video.video_id or discovery.video.local_path,
-                selected_model,
-                selected_device,
-            )
-            # retry_call still covers transient model-download failures; memory
-            # exhaustion is not retryable and is handled by stepping down a plan.
-            transcription = retry_call(
-                lambda: self._resilient.transcribe(
+            prompt = initial_prompt or self._config.whisper_initial_prompt
+            if key is not None:
+                selected_model = model_name or self._config.deepgram_model
+                log.info(
+                    "Transcription selected_method=deepgram source={} model={}",
+                    discovery.video.video_id or discovery.video.local_path,
+                    selected_model,
+                )
+                transcription = retry_call(
+                    lambda: self._deepgram.transcribe(
+                        audio_path,
+                        api_key=key.value,
+                        model=selected_model,
+                        language=selected_language,
+                        keyterms=keyterms_from(prompt),
+                        progress=report_transcription,
+                        cancelled=is_cancelled,
+                    ),
+                    attempts=self._config.retry_count,
+                    delay_seconds=self._config.retry_delay_seconds,
+                    operation_name="deepgram_transcription",
+                )
+            else:
+                transcription = self._transcribe_locally(
                     audio_path,
-                    model_name=selected_model,
-                    device=selected_device,
-                    compute_type=compute_type or self._config.whisper_compute_type,
-                    beam_size=self._config.whisper_beam_size,
-                    word_timestamps=self._config.whisper_word_timestamps,
+                    model_name=model_name,
+                    device=device,
+                    compute_type=compute_type,
                     language=selected_language,
-                    vad_enabled=self._config.whisper_vad_enabled,
-                    min_silence_duration_ms=(
-                        self._config.whisper_min_silence_duration_ms
-                    ),
-                    vad_threshold=self._config.whisper_vad_threshold,
-                    vad_speech_pad_ms=self._config.whisper_vad_speech_pad_ms,
-                    condition_on_previous_text=(
-                        self._config.whisper_condition_on_previous_text
-                    ),
-                    initial_prompt=initial_prompt
-                    or self._config.whisper_initial_prompt,
-                    compression_ratio_threshold=(
-                        self._config.whisper_compression_ratio_threshold
-                    ),
-                    log_prob_threshold=self._config.whisper_log_prob_threshold,
-                    no_speech_threshold=self._config.whisper_no_speech_threshold,
-                    hallucination_silence_threshold=(
-                        self._config.whisper_hallucination_silence_threshold
-                    ),
-                    download_root=self._config.whisper_model_download_directory,
+                    prompt=prompt,
+                    source=discovery.video.video_id or discovery.video.local_path,
                     progress=report_transcription,
                     cancelled=is_cancelled,
-                ),
-                attempts=self._config.retry_count,
-                delay_seconds=self._config.retry_delay_seconds,
-                operation_name="whisper_model_or_transcription",
-            )
+                    log=log,
+                )
             job.status = JobStatus.POST_PROCESSING
             notify("Post-processing", 88.0)
             segments = self.to_subtitle_segments(transcription)
@@ -280,6 +303,75 @@ class TranscriptionService:
                 job.failure_stage,
                 job.duration_seconds,
             )
+
+    def _require_deepgram_key(self) -> DeepgramKey:
+        """The saved or configured key, or a message saying how to add one."""
+        key = self._deepgram_key()
+        if key is None:
+            raise DeepgramKeyMissingError(
+                "Deepgram is picked, but no Deepgram API key is saved. Add one, "
+                "or pick Whisper to transcribe on this computer."
+            )
+        return key
+
+    def _transcribe_locally(
+        self,
+        audio_path: Path,
+        *,
+        model_name: str | None,
+        device: str | None,
+        compute_type: str | None,
+        language: str | None,
+        prompt: str | None,
+        source: object,
+        progress: ProgressCallback,
+        cancelled: CancelCallback,
+        log: Any,
+    ) -> TranscriptionResult:
+        """Run faster-whisper on this computer, degrading instead of failing."""
+        selected_model = model_name or self._config.default_whisper_model
+        selected_device = device or self._config.whisper_device
+        log.info(
+            "Transcription selected_method=whisper source={} model={} device={}",
+            source,
+            selected_model,
+            selected_device,
+        )
+        # retry_call still covers transient model-download failures; memory
+        # exhaustion is not retryable and is handled by stepping down a plan.
+        return retry_call(
+            lambda: self._resilient.transcribe(
+                audio_path,
+                model_name=selected_model,
+                device=selected_device,
+                compute_type=compute_type or self._config.whisper_compute_type,
+                beam_size=self._config.whisper_beam_size,
+                word_timestamps=self._config.whisper_word_timestamps,
+                language=language,
+                vad_enabled=self._config.whisper_vad_enabled,
+                min_silence_duration_ms=self._config.whisper_min_silence_duration_ms,
+                vad_threshold=self._config.whisper_vad_threshold,
+                vad_speech_pad_ms=self._config.whisper_vad_speech_pad_ms,
+                condition_on_previous_text=(
+                    self._config.whisper_condition_on_previous_text
+                ),
+                initial_prompt=prompt,
+                compression_ratio_threshold=(
+                    self._config.whisper_compression_ratio_threshold
+                ),
+                log_prob_threshold=self._config.whisper_log_prob_threshold,
+                no_speech_threshold=self._config.whisper_no_speech_threshold,
+                hallucination_silence_threshold=(
+                    self._config.whisper_hallucination_silence_threshold
+                ),
+                download_root=self._config.whisper_model_download_directory,
+                progress=progress,
+                cancelled=cancelled,
+            ),
+            attempts=self._config.retry_count,
+            delay_seconds=self._config.retry_delay_seconds,
+            operation_name="whisper_model_or_transcription",
+        )
 
     @staticmethod
     def to_subtitle_segments(

@@ -48,9 +48,16 @@ class AudioService:
         force: bool = False,
         progress: ProgressCallback | None = None,
         discovery: SubtitleDiscoveryResult | None = None,
+        audio_format: str | None = None,
+        bitrate_kbps: int | None = None,
     ) -> Path:
-        """Inspect, fetch the audio or read the file, convert it, return the WAV."""
+        """Inspect, fetch the audio or read the file, convert it, return the result.
+
+        That is the configured WAV unless ``audio_format`` asks for something
+        else, such as the Ogg Opus that is uploaded to Deepgram.
+        """
         notify = progress or (lambda _message, _percent: None)
+        container = audio_format or self._config.audio_format
         notify("Validating video and checking captions", None)
         discovery = discovery or self._video_service.inspect(url, language)
         if discovery.selected_track is not None and not force:
@@ -93,19 +100,27 @@ class AudioService:
                     operation_name="audio_download",
                 )
                 job.downloaded_audio_path = source
-            notify("Converting audio to mono 16 kHz PCM WAV", None)
-            inside_output = job_directory / f"prepared.{self._config.audio_format}"
+            notify(
+                (
+                    "Converting audio to mono 16 kHz PCM WAV"
+                    if container == "wav"
+                    else "Compressing audio for upload"
+                ),
+                None,
+            )
+            inside_output = job_directory / f"prepared.{container}"
             self._ffmpeg.convert(
                 source,
                 inside_output,
                 sample_rate=self._config.audio_sample_rate,
                 channels=self._config.audio_channels,
-                audio_format=self._config.audio_format,
+                audio_format=container,
+                bitrate_kbps=bitrate_kbps,
             )
             if preserve:
                 final = inside_output
             else:
-                final = base / f"captionforge-{job.id}.{self._config.audio_format}"
+                final = base / f"captionforge-{job.id}.{container}"
                 shutil.move(str(inside_output), final)
                 cleanup_path(job_directory)
                 job_directory = None

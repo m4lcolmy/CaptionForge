@@ -795,3 +795,188 @@ def test_the_field_takes_a_path_and_the_page_takes_a_file() -> None:
     assert 'type="text"' in field.group(0)
     assert 'id="choose-btn"' in markup
     assert re.search(r'<input type="file" id="file-input"[^>]*hidden>', markup)
+
+
+# ---------- Deepgram ----------
+
+DEEPGRAM_KEY = "0123456789abcdef0123456789abcdef01234567"
+
+
+@pytest.fixture
+def key_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Keep the Deepgram key in this test's folder, and none in the environment."""
+    from app.core.deepgram_key import ENVIRONMENT_NAMES
+
+    monkeypatch.setenv(
+        "CAPTIONFORGE_CONFIG_FILE", str(tmp_path / "settings" / "config.json")
+    )
+    for name in ENVIRONMENT_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    # A .env in the working folder would be read too.
+    monkeypatch.chdir(tmp_path)
+    return tmp_path / "settings" / "deepgram.key"
+
+
+def deepgram_client(tmp_path: Path, status: int) -> TestClient:
+    """A server whose key check gets this HTTP status from "Deepgram"."""
+    import io
+    import urllib.error
+
+    from app.adapters.deepgram_adapter import DeepgramAdapter
+
+    class Answer:
+        def __enter__(self) -> "Answer":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _size: int = -1) -> bytes:
+            return b"{}"
+
+    def opener(request: Any, _timeout: float) -> Answer:
+        if status != 200:
+            raise urllib.error.HTTPError(
+                request.full_url, status, "no", {}, io.BytesIO(b"{}")  # type: ignore[arg-type]
+            )
+        return Answer()
+
+    application = web_server.create_app(
+        Config(
+            default_output_folder=tmp_path / "output",
+            temp_directory=tmp_path / "temp",
+        ),
+        token=TOKEN,
+        port=PORT,
+        preferences_file=tmp_path / "web-preferences.json",
+        deepgram=DeepgramAdapter(opener=opener),
+    )
+    return TestClient(application, base_url=f"http://127.0.0.1:{PORT}")
+
+
+def test_health_tells_whether_a_key_is_saved_but_never_the_key(
+    key_file: Path, tmp_path: Path
+) -> None:
+    from app.core.deepgram_key import save_key
+
+    with deepgram_client(tmp_path, 200) as client:
+        before = client.get("/api/health", headers=HEADERS).json()
+        save_key(DEEPGRAM_KEY, key_file)
+        after = client.get("/api/health", headers=HEADERS)
+    assert before["deepgram"]["saved"] is False
+    assert before["default_engine"] == "whisper"
+    assert before["default_deepgram_model"] == "nova-3"
+    assert after.json()["deepgram"] == {
+        "saved": True,
+        "source": "file",
+        "hint": "…4567",
+        "location": str(key_file.parent),
+    }
+    assert DEEPGRAM_KEY not in after.text
+
+
+def test_a_pasted_key_is_checked_then_saved(key_file: Path, tmp_path: Path) -> None:
+    with deepgram_client(tmp_path, 200) as client:
+        response = client.put(
+            "/api/deepgram-key", json={"key": f" {DEEPGRAM_KEY} "}, headers=HEADERS
+        )
+    assert response.status_code == 200
+    assert response.json()["saved"] is True and response.json()["checked"] is True
+    assert DEEPGRAM_KEY not in response.text
+    assert key_file.read_text(encoding="utf-8").strip() == DEEPGRAM_KEY
+
+
+def test_a_refused_key_is_never_saved(key_file: Path, tmp_path: Path) -> None:
+    with deepgram_client(tmp_path, 401) as client:
+        response = client.put(
+            "/api/deepgram-key", json={"key": DEEPGRAM_KEY}, headers=HEADERS
+        )
+    assert response.status_code == 400
+    assert response.json()["code"] == "DeepgramKeyRejectedError"
+    assert not key_file.exists()
+
+
+def test_offline_a_key_is_saved_and_marked_unchecked(
+    key_file: Path, tmp_path: Path
+) -> None:
+    with deepgram_client(tmp_path, 503) as client:
+        response = client.put(
+            "/api/deepgram-key", json={"key": DEEPGRAM_KEY}, headers=HEADERS
+        )
+    assert response.status_code == 200
+    assert response.json()["checked"] is False
+    assert key_file.is_file()
+
+
+def test_a_key_can_be_forgotten(key_file: Path, tmp_path: Path) -> None:
+    from app.core.deepgram_key import save_key
+
+    save_key(DEEPGRAM_KEY, key_file)
+    with deepgram_client(tmp_path, 200) as client:
+        response = client.delete("/api/deepgram-key", headers=HEADERS)
+    assert response.status_code == 200
+    assert response.json()["saved"] is False
+    assert not key_file.exists()
+
+
+def test_the_chosen_engine_reaches_the_workflow(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen: dict[str, Any] = {}
+    produced = tmp_path / "talk.srt"
+    produced.write_text("1\n", encoding="utf-8")
+
+    def process(url: str, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return StubWorkflowResult(
+            (produced,),
+            VideoMetadata(
+                video_id="qJFbKl6RjLU",
+                title="Talk",
+                webpage_url="https://www.youtube.com/watch?v=qJFbKl6RjLU",
+                original_url=VIDEO_URL,
+            ),
+        )
+
+    stub_workflow(monkeypatch, process)
+    response = client.post(
+        "/api/jobs",
+        json={"url": VIDEO_URL, "engine": "Deepgram", "model": "nova-3"},
+        headers=HEADERS,
+    )
+    assert response.status_code == 202
+    wait_for_terminal(client, response.json()["id"])
+    assert seen["engine"] == "deepgram" and seen["model_name"] == "nova-3"
+
+
+def test_an_unknown_engine_is_refused_before_any_work(client: TestClient) -> None:
+    response = client.post(
+        "/api/jobs", json={"url": VIDEO_URL, "engine": "siri"}, headers=HEADERS
+    )
+    assert response.status_code == 422
+
+
+def test_deepgram_failures_have_stable_statuses() -> None:
+    from app.core.exceptions import (
+        DeepgramCreditError,
+        DeepgramKeyMissingError,
+        DeepgramTimeoutError,
+        DeepgramUnavailableError,
+    )
+    from app.interfaces.web import errors
+
+    assert errors.status_for(DeepgramKeyMissingError("x")) == 400
+    assert errors.status_for(DeepgramCreditError("x")) == 402
+    assert errors.status_for(DeepgramTimeoutError("x")) == 504
+    assert errors.status_for(DeepgramUnavailableError("x")) == 502
+
+
+def test_the_most_used_choices_sit_outside_more_options() -> None:
+    """Engine, model and the captions override are in the card, not the panel."""
+    markup = (web_server.STATIC_DIRECTORY / "index.html").read_text(encoding="utf-8")
+    panel = markup.index('<details class="options"')
+    for control in ('id="engines"', '<select id="model"', 'id="force"'):
+        assert markup.index(control) < panel, control
+    assert "<summary>More options</summary>" in markup
+    script = (web_server.STATIC_DIRECTORY / "app.js").read_text(encoding="utf-8")
+    assert 'value: "deepgram"' in script and 'value: "nova-3"' in script

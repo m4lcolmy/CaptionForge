@@ -37,7 +37,7 @@ class TranscriptionSegment(BaseModel):
 
 
 class TranscriptionResult(BaseModel):
-    """Stable result detached from faster-whisper implementation objects."""
+    """Stable result detached from any engine's implementation objects."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -48,3 +48,6 @@ class TranscriptionResult(BaseModel):
     model_name: str = Field(min_length=1)
     device: str = Field(min_length=1)
     compute_type: str = Field(min_length=1)
+    # "whisper" ran on this computer; "deepgram" ran on Deepgram's servers,
+    # where device and compute type describe nothing a person chose.
+    engine: str = Field(default="whisper", min_length=1)

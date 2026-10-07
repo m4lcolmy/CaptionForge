@@ -3,7 +3,7 @@
 from typing import Final
 
 APP_NAME: Final[str] = "CaptionForge"
-VERSION: Final[str] = "0.8.0"
+VERSION: Final[str] = "0.9.0"
 ENV_PREFIX: Final[str] = "CAPTIONFORGE_"
 ENV_FILE: Final[str] = ".env"
 LOG_FILE_NAME: Final[str] = "captionforge_{time:YYYY-MM-DD}.log"
@@ -12,6 +12,13 @@ LOG_RETENTION: Final[str] = "14 days"
 SUPPORTED_OUTPUT_FORMATS: Final[frozenset[str]] = frozenset(
     {"srt", "vtt", "txt", "json", "docx"}
 )
+# "whisper" runs on this computer; "deepgram" sends the audio to Deepgram.
+TRANSCRIPTION_ENGINES: Final[frozenset[str]] = frozenset({"whisper", "deepgram"})
+DEEPGRAM_API_URL: Final[str] = "https://api.deepgram.com/v1"
+# Mono Opus at this rate is ample for speech recognition, and about a fifth of
+# the 16 kHz PCM WAV that Whisper reads: roughly 21 MB an hour to upload.
+DEEPGRAM_UPLOAD_FORMAT: Final[str] = "ogg"
+DEEPGRAM_UPLOAD_BITRATE_KBPS: Final[int] = 48
 # Heights offered for an MP4 download, highest first. Only the ones a video
 # actually publishes are ever shown, so this is a filter and not a promise.
 MEDIA_VIDEO_HEIGHTS: Final[tuple[int, ...]] = (2160, 1440, 1080, 720, 480, 360)

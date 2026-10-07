@@ -6,6 +6,7 @@ a Whisper model.
 """
 
 import builtins
+import json
 import os
 import platform
 import subprocess
@@ -47,8 +48,10 @@ from app.adapters.package_updater import (  # noqa: E402
 )
 from app.adapters.whisper_adapter import CudaStatus  # noqa: E402
 from app.core.config import Config  # noqa: E402
+from app.core.deepgram_key import DeepgramKey  # noqa: E402
 from app.core.exceptions import (  # noqa: E402
     ConfigurationError,
+    DeepgramKeyRejectedError,
     ExtractorRefusedError,
     LocalFileNotFoundError,
 )
@@ -287,6 +290,11 @@ def finish(record: JobRecord, *files: Path, **fields: Any) -> None:
         record.percent = 100.0
 
 
+def refuse_key(_value: str) -> tuple[DeepgramKey, bool | None]:
+    """The default stand-in: no test reaches Deepgram unless it says so."""
+    raise DeepgramKeyRejectedError("Deepgram did not accept that key.")
+
+
 # ---------- fixtures ----------
 
 
@@ -315,6 +323,9 @@ def make_window(
             fetch=overrides.pop("fetch", lambda url: png_bytes()),
             open_path=lambda path: opened.append(path) or True,
             choose_file=overrides.pop("choose_file", lambda parent, folder: None),
+            deepgram_key=overrides.pop("deepgram_key", lambda: None),
+            save_deepgram_key=overrides.pop("save_deepgram_key", refuse_key),
+            forget_deepgram_key=overrides.pop("forget_deepgram_key", lambda: None),
         )
         window = MainWindow(
             overrides.pop("config", Config()),
@@ -1010,3 +1021,176 @@ def test_the_file_chooser_lists_media_in_either_case() -> None:
     assert "*.mp4" in MEDIA_FILE_FILTER and "*.MP4" in MEDIA_FILE_FILTER
     assert "*.opus" in MEDIA_FILE_FILTER
     assert MEDIA_FILE_FILTER.endswith(";;All files (*)")
+
+
+# ---------- transcribe with: engine, model, key ----------
+
+DEEPGRAM_KEY = "0123456789abcdef0123456789abcdef01234567"
+
+
+def engine_chip(window: MainWindow, name: str) -> Chip:
+    return next(chip for chip in window.engines.chips() if chip.text() == name)
+
+
+def test_the_most_used_choices_sit_outside_more_options(
+    make_window: Callable[..., MainWindow],
+) -> None:
+    """Engine, model and the captions override show without opening anything."""
+    window = looked_up(make_window())
+    assert not window.options.is_open()
+    for control in (window.engines, window.model, window.force):
+        assert control.isVisible()
+    assert window.options.button.text().endswith("More options")
+    assert window.model.currentData() == "small"
+    assert engine_chip(window, "Whisper").picked
+
+
+def test_switching_engines_swaps_the_models_and_keeps_each_pick(
+    make_window: Callable[..., MainWindow],
+) -> None:
+    window = looked_up(make_window())
+    window.model.setCurrentIndex(window.model.findData("medium"))
+
+    engine_chip(window, "Deepgram").click()
+
+    assert window.chosen_engine() == "deepgram"
+    assert window.model.currentData() == "nova-3"
+    assert window.model.findData("medium") == -1
+    # The graphics card is Whisper's business, and there is no key yet.
+    assert window.device_block.isHidden()
+    assert window.key_row.isVisible() and window.key_saved.isHidden()
+    assert "Deepgram" in window.hint.plain()
+    assert "~21.3 MB" in window.engine_help.plain()
+
+    engine_chip(window, "Whisper").click()
+
+    assert window.model.currentData() == "medium"
+    assert not window.device_block.isHidden() and window.key_row.isHidden()
+
+
+def test_the_override_says_what_the_button_will_do(
+    make_window: Callable[..., MainWindow],
+) -> None:
+    window = looked_up(make_window())
+    assert window.run_button.text() == "Get captions"
+
+    window.force.setChecked(True)
+
+    assert window.run_button.text() == "Transcribe"
+    assert window.selection.plain() == (
+        "Will transcribe with Whisper instead of exporting the highlighted track."
+    )
+
+
+def test_deepgram_needs_a_key_only_when_it_would_be_used(
+    make_window: Callable[..., MainWindow],
+) -> None:
+    registry = StubRegistry()
+    window = looked_up(make_window(registry=registry))
+    engine_chip(window, "Deepgram").click()
+
+    window.force.setChecked(True)
+    window.run_button.click()
+
+    assert registry.submitted == []
+    assert window.alert_title.text() == "ADD A DEEPGRAM KEY"
+    assert window.deepgram_key.hasFocus()
+
+    # Without the override the video's own captions are exported: no key needed.
+    window.force.setChecked(False)
+    window.run_button.click()
+    assert len(registry.submitted) == 1
+
+
+def test_a_pasted_key_is_checked_saved_and_used(
+    make_window: Callable[..., MainWindow],
+) -> None:
+    pasted: list[str] = []
+
+    def save(value: str) -> tuple[DeepgramKey, bool | None]:
+        pasted.append(value)
+        return DeepgramKey(DEEPGRAM_KEY, "file"), True
+
+    registry = StubRegistry()
+    window = looked_up(make_window(registry=registry, save_deepgram_key=save))
+    engine_chip(window, "Deepgram").click()
+    window.deepgram_key.setText(DEEPGRAM_KEY)
+
+    window.key_save.click()
+    wait_until(lambda: window.key_saved.isVisible())
+
+    assert pasted == [DEEPGRAM_KEY]
+    assert window.deepgram_key.text() == ""
+    assert window.key_saved_text.plain() == "Deepgram key …4567 saved"
+    window.force.setChecked(True)
+    window.run_button.click()
+    request = registry.submitted[-1]
+    assert isinstance(request, JobRequest)
+    assert (request.engine, request.model) == ("deepgram", "nova-3")
+
+
+def test_a_refused_key_says_why_and_stays_unsaved(
+    make_window: Callable[..., MainWindow],
+) -> None:
+    window = looked_up(make_window())
+    engine_chip(window, "Deepgram").click()
+    window.deepgram_key.setText("nope")
+    window.key_save.click()
+    wait_until(lambda: not window.alert.isHidden())
+    assert window.alert_title.text() == "COULD NOT SAVE THE KEY"
+    assert window.key_row.isVisible()
+
+
+def test_a_key_from_the_environment_cannot_be_forgotten_here(
+    make_window: Callable[..., MainWindow],
+) -> None:
+    window = make_window(deepgram_key=lambda: DeepgramKey(DEEPGRAM_KEY, "environment"))
+    engine_chip(window, "Deepgram").click()
+    assert window.key_saved_text.plain() == "Deepgram key …4567 set in the environment"
+    assert window.key_forget.isHidden()
+
+
+def test_deepgram_results_say_where_they_were_made(
+    make_window: Callable[..., MainWindow], tmp_path: Path
+) -> None:
+    registry = StubRegistry()
+    window = looked_up(make_window(registry=registry))
+    window.run_button.click()
+    produced = tmp_path / "talk.srt"
+    produced.write_text("1\n", encoding="utf-8")
+    finish(
+        registry.records["job-1"],
+        produced,
+        used_existing_captions=False,
+        transcription_summary={
+            "engine": "deepgram",
+            "detected_language": "tr",
+            "language_probability": 0.9,
+            "model_name": "nova-3",
+            "device": "deepgram",
+            "compute_type": "cloud",
+        },
+    )
+    window._poll()
+
+    assert window.results_label.text() == "TRANSCRIBED BY DEEPGRAM"
+    assert "Deepgram nova-3, detected tr (90% confident)" in window.results_note.text()
+
+
+def test_the_engine_and_both_models_are_remembered(
+    make_window: Callable[..., MainWindow], tmp_path: Path
+) -> None:
+    window = make_window()
+    window.model.setCurrentIndex(window.model.findData("base"))
+    engine_chip(window, "Deepgram").click()
+    window.close()
+
+    saved = json.loads((tmp_path / "prefs.json").read_text(encoding="utf-8"))
+    assert saved["engine"] == "deepgram"
+    assert (saved["model"], saved["deepgram_model"]) == ("base", "nova-3")
+
+    again = make_window()
+    assert engine_chip(again, "Deepgram").picked
+    assert again.model.currentData() == "nova-3"
+    engine_chip(again, "Whisper").click()
+    assert again.model.currentData() == "base"

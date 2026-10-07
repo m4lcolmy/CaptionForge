@@ -1,7 +1,7 @@
 # CaptionForge — Uygulama Nasıl Çalışır
 
 Uygulamanın iç işleyişine dair çalışan bir rehber: hangi katman ne yapıyor, her
-komutta ne oluyor ve çıktıyı hangi kurallar belirliyor. Sürüm 0.8.0, Python
+komutta ne oluyor ve çıktıyı hangi kurallar belirliyor. Sürüm 0.9.0, Python
 3.12+.
 
 ---
@@ -15,16 +15,19 @@ ucuz olanı tercih eder:
 
 1. **Mevcut YouTube altyazıları** — yalnızca altyazı izi indirilir, medya
    indirilmez.
-2. **Yerel transkripsiyon** — yalnızca istenen dilde eşleşen bir altyazı yoksa
+2. **Transkripsiyon** — yalnızca istenen dilde eşleşen bir altyazı yoksa
    (veya `--force` verildiyse). Sadece ses akışı indirilir, mono 16 kHz PCM WAV'a
    dönüştürülür ve yerel makinede `faster-whisper`'a verilir. Bu bilgisayardaki
    bir dosyanın YouTube altyazısı olmadığından her zaman bu yolu izler; sesi
-   indirilmez, dosya bulunduğu yerde dönüştürülür.
+   indirilmez, dosya bulunduğu yerde dönüştürülür. `deepgram` motoru seçildiyse
+   ses bunun yerine mono Opus olarak sıkıştırılıp Deepgram'a yüklenir ve
+   transkript oradan geri gelir (bölüm 7).
 
 Hiçbir yolda video akışı indirilmez. YouTube (`yt-dlp` üzerinden), ilk model
-indirmesinde Whisper model sunucusu ve CaptionForge kendi paketlerinin yeni
-sürümlerini ararken PyPI dışında hiçbir servise ağ çağrısı yapılmaz. Bu
-paketlerin hiçbiri sorulmadan kurulmaz.
+indirmesinde Whisper model sunucusu, CaptionForge kendi paketlerinin yeni
+sürümlerini ararken PyPI ve yalnızca o motor seçilip bir transkripsiyon gerçekten
+çalıştığında ya da yapıştırılan bir anahtar kontrol edilirken Deepgram dışında
+hiçbir servise ağ çağrısı yapılmaz. Hiçbir şey sorulmadan kurulmaz.
 
 ---
 
@@ -40,13 +43,14 @@ app/
 │   ├── video_service.py         URL veya dosya → doğrulama + kontroller + keşif
 │   ├── subtitle_service.py      iz seçimi, altyazı ayrıştırma, asgari temizlik
 │   ├── audio_service.py         iş alanı, ses indirme, FFmpeg dönüştürme
-│   ├── transcription_service.py altyazı-öncelikli akış, Whisper yedeği, dışa aktarım
+│   ├── transcription_service.py altyazı-öncelikli akış, Whisper/Deepgram yedeği, dışa aktarım
 │   ├── postprocessing_service.py  zamanlama + metin normalizasyonu (tüm kaynaklar için ortak)
 │   └── export_service.py        format doğrulama, dosya adı, atomik çok formatlı yazma
 ├── adapters/            dış dünyayla konuşan her şey
 │   ├── ytdlp_adapter.py    meta veri, altyazı indirme, ses indirme, hata çevirisi
 │   ├── ffmpeg_adapter.py   alt süreç (shell yok), dönüştürme, FFprobe, hata çevirisi
-│   └── whisper_adapter.py  tembel faster-whisper importu, cihaz/hesaplama seçimi
+│   ├── whisper_adapter.py  tembel faster-whisper importu, cihaz/hesaplama seçimi
+│   └── deepgram_adapter.py Deepgram'a akışlı yükleme, yanıt → TranscriptionResult
 ├── models/              donmuş (frozen) Pydantic sözleşmeleri (VideoMetadata, SubtitleTrack, …)
 ├── exporters/           saf render fonksiyonları: segmentler → metin
 ├── utils/               saf yardımcılar (URL, yerel yol, zaman, dil, dosya adı, Arapça metin)
@@ -95,6 +99,8 @@ Pratikte önem taşıyan doğrulama kuralları:
 
 | Ayar | Kural |
 |---|---|
+| `transcription_engine` | `whisper` (varsayılan) \| `deepgram` |
+| `deepgram_model` | herhangi bir Deepgram model adı; varsayılan `nova-3` |
 | `whisper_device` | `auto` \| `cpu` \| `cuda` |
 | `whisper_compute_type` | `auto`, `default`, `int8`, `int8_float16`, `int8_float32`, `int16`, `float16`, `float32`, `bfloat16` |
 | `maximum_subtitle_lines` | yalnızca 1 veya 2 |
@@ -115,13 +121,14 @@ Pratikte önem taşıyan doğrulama kuralları:
 | `doctor` | hayır | test için output/temp dizinlerini oluşturur | yerel kontroller |
 | `inspect` | yalnızca meta veri | hayır | `VideoService.inspect` |
 | `extract` | meta veri + altyazı izi | evet | altyazı → ayrıştır → son işleme → dışa aktar |
-| `transcribe` | meta veri + (altyazı **veya** ses) | evet | altyazı öncelikli, Whisper yedekli |
+| `transcribe` | meta veri + (altyazı **veya** ses); `--engine deepgram` ile Deepgram'a yükleme | evet | altyazı öncelikli, Whisper veya Deepgram yedekli |
 | `prepare-audio` | meta veri + ses | yalnızca WAV | `AudioService.prepare` |
 | `clean` | yok | evet | yerel dosya → ayrıştır → son işleme → dışa aktar |
 | `web` | sayfanın istediği kadar | evet | `127.0.0.1` üzerinde FastAPI |
 | `desktop` | pencerenin istediği kadar | evet | aynı servisler üzerinde bir Qt penceresi |
 | `install-desktop` | hayır | bir masaüstü girdisi ve bir simge | `interfaces/launcher.py` |
 | `update` | PyPI | seçtiğiniz paketler | `PackageUpdater.check` → sor → `install` |
+| `deepgram-key` | anahtarı kontrol için Deepgram | `deepgram.key` (mod 0600) | `check_and_save_key`; `--forget` siler |
 
 Bağlantı yerine bu bilgisayardaki bir dosya verildiğinde `inspect`, `transcribe`
 ve `prepare-audio` (ilk model indirmesi dışında) hiç ağ çağrısı yapmaz; `extract`
@@ -334,24 +341,30 @@ Kaynak segmentasyonunun birebir korunması gerektiğinde bunu kullanın.
 
 ---
 
-## 7. `transcribe` — altyazı öncelikli, Whisper yedekli
+## 7. `transcribe` — altyazı öncelikli, sonra Whisper veya Deepgram
 
-İki kaynak arasındaki kararı veren tek yer `TranscriptionService.process`'tir.
+Kaynaklar ve iki motor arasındaki kararı veren tek yer
+`TranscriptionService.process`'tir.
 
 ```
 incele (%5)
   ├── iz bulundu ve --force yok  → altyazıyı indir (%25) → dışa aktar (%85) → bitti
   └── aksi hâlde
+        Deepgram seçili mi? → anahtar yok → DeepgramKeyMissingError, hiçbir indirmeden önce
         sesi hazırla (%10 → %25)
           ├── iş dizini oluştur + disk kontrolü
           ├── yt-dlp bestaudio indirme   (dosyada atlanır)
-          └── ffmpeg → mono 16 kHz PCM WAV
-        modeli yükle (%30)
-        transkribe et (%40 → %85)
+          └── ffmpeg → mono 16 kHz PCM WAV   (Deepgram: mono Opus, 48 kbps)
+        Whisper:  modeli yükle (%30) → transkribe et (%40 → %85)
+        Deepgram: yükle (%40 → %75) → bekle (%78) → yanıtı oku (%85)
         son işleme (%88)
         dışa aktar (%92)
         bitti (%100)
 ```
+
+Motor istekten gelir (`--engine`, sayfanın veya pencerenin **Transcribe with**
+çipleri), yoksa `transcription_engine` ayarından. Altyazı izi yeniden kullanılan
+bir video hiçbir motora, dolayısıyla anahtara da ihtiyaç duymaz.
 
 İlerleme yüzdeleri gerçek ve belirlenimcidir — ses alt ilerlemesi
 `10 + yüzde * 0.15` ile yeniden eşlenir, Whisper'ın segment döngüsü geçen ses
@@ -372,9 +385,11 @@ bilinmiyorsa `min(84, 40 + segment_sırası)` şeklinde yavaş bir sayaca düşe
   FFmpeg onu yerinde okur; dosya asla taşınmaz, kopyalanmaz veya silinmez.
 - FFmpeg asla shell üzerinden değil, argüman listesiyle çağrılır:
   `-y -i <kaynak> -vn -acodec pcm_s16le -ar 16000 -ac 1 <hedef>`. Sonrasında
-  çıktının var olduğu ve boş olmadığı doğrulanır. `audio_format` yalnızca dosya
-  uzantısını değiştirir — codec her zaman `pcm_s16le`'dir, Whisper'ın istediği
-  budur.
+  çıktının var olduğu ve boş olmadığı doğrulanır. Codec kapsayıcıya göre
+  seçilir: `wav` → `pcm_s16le` (Whisper'ın istediği), `ogg` → `libopus`,
+  `-b:a 48k -vbr constrained` ile (Deepgram'a gönderilen). Kısıtlı VBR dosyayı
+  arayüzlerin gösterdiği boyutun yaklaşık %2 yakınında tutar; Opus'un serbest
+  VBR'ı sabit bir tonda %27 aşmıştı.
 - Saklama istenmediğinde başarı sonrası WAV
   `<temp>/captionforge-<uuid>.wav` konumuna taşınır ve iş dizini silinir.
   Saklama istendiğinde her şey iş dizininde kalır.
@@ -386,6 +401,35 @@ Tek başına `prepare-audio`, eşleşen bir altyazı varsa `--force` olmadan
 çalışmayı reddeder — normal akışın parçası değil, bir tanılama komutudur.
 `transcribe` içinden her zaman `force=True` (karar zaten verilmiştir) ve
 `keep_temp=True` (temizliği `finally` bloğunda çağıran üstlenir) ile çağrılır.
+
+### Deepgram adaptörü ([app/adapters/deepgram_adapter.py](../app/adapters/deepgram_adapter.py))
+
+- Yalnızca standart kütüphane (`urllib`); SDK yok. `model`, `smart_format`,
+  `punctuate`, `utterances` ve `language` ya da `detect_language` ile tek bir
+  `POST /v1/listen`. "Names and spellings" virgüllerden bölünüp tekrarlanan
+  `keyterm` (Nova-3, Flux) veya `keywords` (eski modeller) parametrelerine
+  dönüşür; Deepgram 500 tokeni aşan isteği reddettiği için 300 kelimeyle
+  sınırlanır.
+- Gövde dosyanın kendisidir; `http.client` onu yükleme ilerlemesini bildiren ve
+  iptalde hata fırlatan bir sarmalayıcı üzerinden bloklar hâlinde okur. İstek bir
+  işçi iş parçacığında çalışır, böylece Deepgram hâlâ düşünürken de İptal çalışır:
+  çağıran hemen beklemeyi bırakır, yanıt geldiğinde atılır.
+- Her utterance bir segment olur; metni `punctuated_word`'lerden yeniden kurulur,
+  böylece kelime sayısı kelime zamanlamalarıyla eşleşir ve satır bölme gerçek
+  kelime sınırlarında yapılır. Utterance içermeyen yanıt 0,8 sn'lik
+  duraklamalardan bölünür.
+- Hatalar: 401/403 → `DeepgramKeyRejectedError`, 402 → `DeepgramCreditError`,
+  400 → Deepgram'ın `err_msg`'ını taşıyan `DeepgramRequestError`, 504 →
+  `DeepgramTimeoutError` (yeniden denenmez: aynı ses yine zaman aşımına uğrar),
+  429/5xx/erişilemez → yeniden denenebilir `DeepgramUnavailableError`.
+- Anahtar ([app/core/deepgram_key.py](../app/core/deepgram_key.py)) sırasıyla
+  `CAPTIONFORGE_DEEPGRAM_API_KEY` / `DEEPGRAM_API_KEY`, `.env` ve
+  `config.json`'ın yanındaki `deepgram.key` dosyasından okunur; dosya `mkstemp`
+  ile yazıldığından ilk bayttan itibaren 0600 modundadır. Bir `Config` alanı
+  değildir, bu yüzden `config show` ve `persist` onu sızdıramaz; arayüzler
+  yalnızca son dört karakterini görür. `check_and_save_key` kaydetmeden önce
+  Deepgram'a sorar (`GET /v1/projects`): 401 reddeder, 403 yine gerçek bir
+  anahtar sayılır, çevrimdışıyken kontrol edilmeden kaydedilir.
 
 ### Whisper adaptörü ([app/adapters/whisper_adapter.py](../app/adapters/whisper_adapter.py))
 
@@ -661,7 +705,10 @@ integration` ile çalıştırılır.
 
 Çevrimdışı test mümkündür çünkü her dış sınır enjekte edilebilir:
 `YtDlpAdapter(extractor_factory=…)`, `FFmpegAdapter(runner=…)`,
-`WhisperAdapter(model_factory=…, cuda_detector=…)` ve `retry_call(sleep=…)`.
+`WhisperAdapter(model_factory=…, cuda_detector=…)`, `DeepgramAdapter(opener=…)`
+ve `retry_call(sleep=…)`. Bir Deepgram testi, yüklemenin eksiksiz aktığını
+kanıtlamak için `127.0.0.1` üzerinde gerçek bir HTTP sunucusu çalıştırır;
+hiçbiri Deepgram'a ulaşmaz.
 
 ---
 
@@ -693,9 +740,6 @@ Mevcut koddaki, bilinmesinde fayda olan pürüzler:
   `[download]` ilerleme ve `ERROR:` satırlarını doğrudan terminale yazıyor. Bu,
   "ham yt-dlp metni asla stdout'a ulaşmaz" güvencesiyle çelişiyor; `noprogress`
   ayarlanmamış.
-- `FFmpegAdapter.build_conversion_command` içinde
-  `codec = "pcm_s16le" if … else "pcm_s16le"` şeklinde bir dal var;
-  `audio_format` yalnızca dosya uzantısını etkiliyor.
 - `configure_logging`'in docstring'i konsol ve dosya handler'ından söz ediyor,
   ancak yalnızca dosya handler'ı kaydediliyor.
 - `clean` komutu `ExportService`'i yeniden kullanabilmek için girdi dosyası için

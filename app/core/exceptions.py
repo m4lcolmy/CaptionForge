@@ -239,6 +239,41 @@ class TranscriptionCancelledError(TranscriptionError):
     """Raised when the user cancels an active transcription."""
 
 
+class DeepgramError(TranscriptionError):
+    """Base class for failures of the Deepgram transcription service."""
+
+
+class DeepgramKeyMissingError(DeepgramError):
+    """Raised when Deepgram was picked but no API key is saved or set."""
+
+
+class DeepgramKeyRejectedError(DeepgramError):
+    """Raised when Deepgram refuses the API key it was given."""
+
+
+class DeepgramCreditError(DeepgramError):
+    """Raised when the Deepgram account has no credit left for the request."""
+
+
+class DeepgramRequestError(DeepgramError):
+    """Raised when Deepgram turns down the request itself, such as its language."""
+
+
+class DeepgramUnavailableError(DeepgramError):
+    """Raised when Deepgram cannot be reached or fails on its side."""
+
+    @property
+    def retryable(self) -> bool:
+        return True
+
+
+class DeepgramTimeoutError(DeepgramError):
+    """Raised when Deepgram gives up on a recording that takes too long.
+
+    Sending the same audio again would fail the same way, so it is not retried.
+    """
+
+
 class ExportError(CaptionForgeError):
     """Raised when subtitle output cannot be safely exported."""
 

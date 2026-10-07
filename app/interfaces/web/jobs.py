@@ -33,6 +33,7 @@ class JobRequest:
     url: str
     language: str | None = None
     formats: tuple[str, ...] = ()
+    engine: str | None = None
     model: str | None = None
     device: str | None = None
     compute_type: str | None = None
@@ -210,6 +211,7 @@ class JobRegistry:
             result = service.process(
                 request.url,
                 language=request.language,
+                engine=request.engine,
                 model_name=request.model,
                 device=request.device,
                 compute_type=request.compute_type,
@@ -357,6 +359,7 @@ class JobRegistry:
         if result.transcription is not None:
             info = result.transcription
             summary = {
+                "engine": info.engine,
                 "detected_language": info.detected_language,
                 "language_probability": info.language_probability,
                 "model_name": info.model_name,

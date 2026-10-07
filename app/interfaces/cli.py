@@ -17,12 +17,14 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
+from app.adapters.deepgram_adapter import DeepgramAdapter, check_and_save_key
 from app.adapters.ffmpeg_adapter import FFmpegAdapter
 from app.adapters.package_updater import UPDATER, AvailableUpdate, InstalledUpdate
 from app.adapters.whisper_adapter import WhisperAdapter
 from app.adapters.ytdlp_adapter import YtDlpAdapter
 from app.core.config import Config
 from app.core.constants import APP_NAME, VERSION, ExitCode
+from app.core.deepgram_key import forget_key, key_path, load_key
 from app.core.exceptions import (
     CaptionForgeError,
     ConfigurationError,
@@ -249,6 +251,8 @@ def doctor() -> None:
         table.add_row("Recommended compute type", recommended_compute)
         table.add_row("GPU memory", _gpu_memory_status())
         table.add_row("Planned configuration", _planned_configuration(config))
+        table.add_row("Transcription engine", config.transcription_engine)
+        table.add_row("Deepgram key", _deepgram_key_status())
         table.add_row(
             "Writable temporary folder",
             f"{'Yes' if temp_writable else 'No'} ({config.temp_directory})",
@@ -308,8 +312,16 @@ def transcribe(
     language: str | None = typer.Option(
         None, "--language", "-l", help="Caption/transcription language."
     ),
+    engine: str | None = typer.Option(
+        None,
+        "--engine",
+        help="whisper (on this computer, the default) or deepgram (uploads "
+        "the audio to Deepgram).",
+    ),
     model: str | None = typer.Option(
-        None, "--model", help="faster-whisper model name or local model path."
+        None,
+        "--model",
+        help="Whisper model name or folder, or a Deepgram model such as nova-3.",
     ),
     device: str | None = typer.Option(
         None, "--device", help="Device: auto, cpu, or cuda."
@@ -320,7 +332,8 @@ def transcribe(
     prompt: str | None = typer.Option(
         None,
         "--prompt",
-        help="Vocabulary hint for Whisper, e.g. names and terms in the video.",
+        help="Names and terms in the video, comma-separated. Whisper reads them "
+        "as a hint; Deepgram takes them as key terms.",
     ),
     formats: Annotated[
         list[str] | None,
@@ -357,9 +370,10 @@ def transcribe(
         help="Also consider YouTube machine-translated caption tracks.",
     ),
 ) -> None:
-    """Export existing captions or fall back to local faster-whisper.
+    """Export existing captions, or transcribe with Whisper or Deepgram.
 
     A file on this computer has no captions to reuse, so it is always transcribed.
+    Whisper runs here; --engine deepgram uploads a compressed copy of the audio.
     """
 
     def run(config: Config) -> None:
@@ -379,6 +393,7 @@ def transcribe(
             WhisperAdapter(),
             ExportService(),
             config,
+            deepgram=DeepgramAdapter(),
         )
 
         def report(message: str, percent: float | None) -> None:
@@ -388,6 +403,7 @@ def transcribe(
         result = service.process(
             video_url,
             language=language,
+            engine=engine,
             model_name=model,
             device=device,
             compute_type=compute_type,
@@ -402,23 +418,30 @@ def transcribe(
             initial_prompt=prompt,
             progress=report,
         )
-        source = (
-            "existing captions"
-            if result.used_existing_captions
-            else "local Whisper transcription"
-        )
+        info = result.transcription
+        if result.used_existing_captions or info is None:
+            source = "existing captions"
+        elif info.engine == "deepgram":
+            source = "Deepgram transcription"
+        else:
+            source = "local Whisper transcription"
         console.print(f"[bold green]Completed using {source}.[/bold green]")
-        if result.transcription is not None:
-            info = result.transcription
+        if info is not None:
             probability = (
                 f", probability {info.language_probability:.1%}"
                 if info.language_probability is not None
                 else ""
             )
+            # Device and compute type describe this computer, so a Deepgram
+            # result has neither worth printing.
+            hardware = (
+                ""
+                if info.engine == "deepgram"
+                else f"; device: {info.device}; compute type: {info.compute_type}"
+            )
             console.print(
                 f"Language: {info.detected_language}{probability}; "
-                f"model: {info.model_name}; device: {info.device}; "
-                f"compute type: {info.compute_type}"
+                f"model: {info.model_name}{hardware}"
             )
         if result.prepared_audio_path is not None:
             console.print(
@@ -427,6 +450,48 @@ def transcribe(
             )
         for path in result.paths:
             console.print(str(path.resolve()), markup=False)
+
+    _run_with_config(run)
+
+
+@app.command(name="deepgram-key")
+def deepgram_key(
+    forget: bool = typer.Option(
+        False, "--forget", help="Remove the saved key instead of saving one."
+    ),
+) -> None:
+    """Save the Deepgram API key that --engine deepgram uses, or remove it.
+
+    The key is checked with Deepgram, then kept in a file only you can read.
+    CAPTIONFORGE_DEEPGRAM_API_KEY or DEEPGRAM_API_KEY, when set, take priority.
+    """
+
+    def run(_config: Config) -> None:
+        if forget:
+            removed = forget_key()
+            console.print(
+                "Removed the saved Deepgram key."
+                if removed
+                else "No Deepgram key was saved."
+            )
+            remaining = load_key()
+            if remaining is not None and remaining.source == "environment":
+                console.print(
+                    f"A key ({remaining.hint}) is still set in the environment."
+                )
+            return
+        saved, verdict = check_and_save_key(
+            typer.prompt("Deepgram API key", hide_input=True)
+        )
+        console.print(
+            f"[bold green]Saved[/bold green] the Deepgram key {saved.hint} in "
+            f"{escape(str(key_path()))}"
+        )
+        if verdict is None:
+            console.print(
+                "[yellow]Deepgram could not be reached to check it now; it is "
+                "checked again the first time it is used.[/yellow]"
+            )
 
     _run_with_config(run)
 
@@ -734,7 +799,8 @@ def web(
             Panel(
                 f"[bold green]{url}[/bold green]\n\n"
                 "Downloading, conversion and transcription all run on this "
-                "computer.\nKeep this terminal open; press Ctrl+C to stop.",
+                "computer,\nunless you pick Deepgram, which is sent the audio.\n"
+                "Keep this terminal open; press Ctrl+C to stop.",
                 title=f"{APP_NAME} is serving",
                 border_style="green",
             )
@@ -1008,6 +1074,15 @@ def _planned_configuration(config: Config) -> str:
     if planned == requested:
         return planned.describe()
     return f"{planned.describe()} - reduced from {requested.model_name} to fit"
+
+
+def _deepgram_key_status() -> str:
+    """Whether a key is there, and from where, without asking Deepgram."""
+    key = load_key()
+    if key is None:
+        return "Not set - run 'captionforge deepgram-key' to add one"
+    where = "environment" if key.source == "environment" else str(key_path())
+    return f"Set ({key.hint}, from {where})"
 
 
 def _updates_status(config: Config) -> str:

@@ -2,7 +2,7 @@
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.core.constants import SUPPORTED_OUTPUT_FORMATS
+from app.core.constants import SUPPORTED_OUTPUT_FORMATS, TRANSCRIPTION_ENGINES
 
 
 class InspectRequest(BaseModel):
@@ -23,6 +23,8 @@ class JobRequestBody(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
     language: str | None = Field(default=None, max_length=32)
     formats: tuple[str, ...] = ()
+    # "whisper" or "deepgram"; ``model`` names a model of whichever it is.
+    engine: str | None = Field(default=None, max_length=16)
     model: str | None = Field(default=None, max_length=256)
     device: str | None = Field(default=None, max_length=32)
     compute_type: str | None = Field(default=None, max_length=32)
@@ -45,6 +47,25 @@ class JobRequestBody(BaseModel):
                 f"Unsupported format(s): {', '.join(unknown)}. Choose from {supported}."
             )
         return value
+
+    @field_validator("engine")
+    @classmethod
+    def validate_engine(cls, value: str | None) -> str | None:
+        """Accept only the engines the transcription service knows."""
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized not in TRANSCRIPTION_ENGINES:
+            raise ValueError(f"Unknown engine '{value}'. Choose whisper or deepgram.")
+        return normalized
+
+
+class DeepgramKeyBody(BaseModel):
+    """A Deepgram API key pasted into the page, to be checked and saved."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(min_length=1, max_length=512)
 
 
 class UpdateRequestBody(BaseModel):

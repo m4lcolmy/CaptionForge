@@ -1,5 +1,6 @@
 """Shared construction of the CaptionForge service graph."""
 
+from app.adapters.deepgram_adapter import DeepgramAdapter
 from app.adapters.ffmpeg_adapter import FFmpegAdapter
 from app.adapters.whisper_adapter import WhisperAdapter
 from app.adapters.ytdlp_adapter import YtDlpAdapter
@@ -55,4 +56,5 @@ def create_transcription_service(config: Config) -> TranscriptionService:
         WhisperAdapter(),
         ExportService(),
         config,
+        deepgram=DeepgramAdapter(),
     )

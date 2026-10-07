@@ -1,7 +1,7 @@
 # CaptionForge — How the App Works
 
 A working guide to the internals: what each layer does, what happens on every
-command, and which rules decide the output. Version 0.8.0, Python 3.12+.
+command, and which rules decide the output. Version 0.9.0, Python 3.12+.
 
 ---
 
@@ -12,12 +12,14 @@ computer, into subtitle/transcript files (`srt`, `vtt`, `txt`, `json`, `docx`).
 It has two sources of text and always prefers the cheap one:
 
 1. **Existing YouTube captions** — downloaded as a caption track only, no media.
-2. **Local transcription** — only when no caption matches the requested
+2. **Transcription** — only when no caption matches the requested
    language (or `--force` is passed). Audio-only stream is downloaded,
    converted to mono 16 kHz PCM WAV, and fed to `faster-whisper` on the local
    machine. A file on this computer has no YouTube captions, so it always takes
    this path, and its sound is converted where the file lies instead of being
-   downloaded.
+   downloaded. With the `deepgram` engine picked, the audio is compressed to
+   mono Opus instead and uploaded to Deepgram, which sends the transcript back
+   (section 7).
 
 It also does one thing that produces no text at all: **whole-file downloads**
 (`download`, or the page's download row) save the video as MP4 at a chosen
@@ -26,9 +28,10 @@ stream, it happens only when explicitly asked for, and it is kept in its own
 service so no caption or transcription path can reach it by accident.
 
 There is no network call to any service other than YouTube (via `yt-dlp`), the
-Whisper model host on first model download, and PyPI when CaptionForge checks
-for newer releases of its own packages (section 11). It installs none of them
-without asking.
+Whisper model host on first model download, PyPI when CaptionForge checks
+for newer releases of its own packages (section 11), and Deepgram, only when
+that engine is picked and a transcription actually runs, or a pasted key is
+being checked. It installs nothing without asking.
 
 ---
 
@@ -45,17 +48,19 @@ app/
 │   ├── subtitle_service.py      track selection, caption parsing, minimal cleanup
 │   ├── audio_service.py         job workspace, audio download, FFmpeg conversion
 │   ├── media_service.py         whole-file MP4/MP3 downloads: naming, disk, cleanup
-│   ├── transcription_service.py caption-first workflow, Whisper fallback, export
+│   ├── transcription_service.py caption-first workflow, Whisper/Deepgram fallback, export
 │   ├── postprocessing_service.py  timing + text normalization (shared by all sources)
 │   └── export_service.py        format validation, filename, atomic multi-format write
 ├── adapters/            everything that talks to the outside world
 │   ├── ytdlp_adapter.py    metadata, caption/audio/media download, format mapping, error translation
 │   ├── ffmpeg_adapter.py   subprocess (no shell), conversion, FFprobe, error translation
-│   └── whisper_adapter.py  lazy faster-whisper import, device/compute selection
+│   ├── whisper_adapter.py  lazy faster-whisper import, device/compute selection
+│   └── deepgram_adapter.py streamed upload to Deepgram, reply → TranscriptionResult
 ├── models/              frozen Pydantic contracts (VideoMetadata, SubtitleTrack, …)
 ├── exporters/           pure render functions: segments → text
 ├── utils/               pure helpers (URL, local path, time, language, filenames, Arabic text)
-└── core/                config, constants, exception hierarchy, retry, logging
+└── core/                config, constants, exception hierarchy, retry, logging,
+                         and deepgram_key.py: where the Deepgram key is found and kept
 ```
 
 The dependency direction is strict: `cli → services → adapters → models/utils`.
@@ -99,6 +104,8 @@ Validated constraints that matter in practice:
 
 | Setting | Rule |
 |---|---|
+| `transcription_engine` | `whisper` (default) \| `deepgram` |
+| `deepgram_model` | any Deepgram model name; `nova-3` by default |
 | `whisper_device` | `auto` \| `cpu` \| `cuda` |
 | `whisper_compute_type` | `auto`, `default`, `int8`, `int8_float16`, `int8_float32`, `int16`, `float16`, `float32`, `bfloat16` |
 | `maximum_subtitle_lines` | 1 or 2 only |
@@ -119,7 +126,7 @@ Validated constraints that matter in practice:
 | `doctor` | no | creates output/temp dirs to test them | local probes |
 | `inspect` | metadata only | no | `VideoService.inspect` |
 | `extract` | metadata + caption track | yes | captions → parse → post-process → export |
-| `transcribe` | metadata + (caption **or** audio) | yes | caption-first, Whisper fallback |
+| `transcribe` | metadata + (caption **or** audio); Deepgram upload with `--engine deepgram` | yes | caption-first, Whisper or Deepgram fallback |
 | `prepare-audio` | metadata + audio | WAV only | `AudioService.prepare` |
 | `download` | metadata + **video and/or audio stream** | yes | `MediaService.download` |
 | `clean` | none | yes | local file → parse → post-process → export |
@@ -127,6 +134,7 @@ Validated constraints that matter in practice:
 | `desktop` | whatever the window asks for | yes | a Qt window over the same services |
 | `install-desktop` | no | one desktop entry and one icon | `interfaces/launcher.py` |
 | `update` | PyPI | the packages you pick | `PackageUpdater.check` → ask → `install` |
+| `deepgram-key` | Deepgram, to check the key | `deepgram.key` (mode 0600) | `check_and_save_key`; `--forget` deletes it |
 
 Given a file on this computer instead of a link, `inspect`, `transcribe` and
 `prepare-audio` make no network call at all (beyond a first model download), and
@@ -326,25 +334,30 @@ source segmentation must be preserved verbatim.
 
 ---
 
-## 7. `transcribe` — caption-first with a Whisper fallback
+## 7. `transcribe` — caption-first, then Whisper or Deepgram
 
-`TranscriptionService.process` is the only place that decides between the two
-sources.
+`TranscriptionService.process` is the only place that decides between the
+sources, and between the two engines.
 
 ```
 inspect (5%)
   ├── track found and not --force  → download captions (25%) → export (85%) → done
   └── otherwise
+        Deepgram picked? → no key → DeepgramKeyMissingError, before any download
         prepare audio (10% → 25%)
           ├── create job dir + disk check
           ├── yt-dlp bestaudio download   (a file skips this)
-          └── ffmpeg → mono 16 kHz PCM WAV
-        load model (30%)
-        transcribe (40% → 85%)
+          └── ffmpeg → mono 16 kHz PCM WAV   (Deepgram: mono Opus, 48 kbps)
+        Whisper:  load model (30%) → transcribe (40% → 85%)
+        Deepgram: upload (40% → 75%) → wait (78%) → read reply (85%)
         post-process (88%)
         export (92%)
         done (100%)
 ```
+
+The engine comes from the request (`--engine`, the page's or window's
+**Transcribe with** chips), else `transcription_engine`. A video whose caption
+track is reused never needs an engine, so it never needs a key either.
 
 The progress percentages are real and deterministic — the audio sub-progress is
 remapped with `10 + percent * 0.15`, and Whisper's segment loop maps elapsed
@@ -365,9 +378,11 @@ slow `min(84, 40 + segment_index)` crawl when the duration is unknown.
   FFmpeg reads it in place, and it is never moved, copied, or removed.
 - FFmpeg is invoked as an argument list, never through a shell:
   `-y -i <src> -vn -acodec pcm_s16le -ar 16000 -ac 1 <dst>`. The output is
-  verified to exist and be non-empty afterwards. Note that `audio_format` only
-  changes the file extension — the codec is always `pcm_s16le`, which is what
-  Whisper wants.
+  verified to exist and be non-empty afterwards. The codec follows the
+  container: `wav` → `pcm_s16le` (what Whisper wants), `ogg` → `libopus` with
+  `-b:a 48k -vbr constrained` (what Deepgram is sent). Constrained VBR keeps
+  the file within about 2% of the size the interfaces show; Opus's free VBR
+  ran 27% over on a steady tone.
 - On success without preservation, the WAV is moved out to
   `<temp>/captionforge-<uuid>.wav` and the job directory is deleted. With
   preservation, everything stays inside the job directory.
@@ -379,6 +394,33 @@ Standalone `prepare-audio` refuses to run when a matching caption exists,
 unless `--force` — it is a diagnostic command, not part of the normal flow.
 Inside `transcribe` it is always called with `force=True` (the decision was
 already made) and `keep_temp=True` (the caller owns cleanup, in its `finally`).
+
+### Deepgram adapter ([app/adapters/deepgram_adapter.py](../app/adapters/deepgram_adapter.py))
+
+- Standard library only (`urllib`); no SDK. One `POST /v1/listen` with
+  `model`, `smart_format`, `punctuate`, `utterances`, and either `language`
+  or `detect_language`. "Names and spellings" are split at commas into
+  repeated `keyterm` parameters (Nova-3, Flux) or `keywords` (older models),
+  capped at 300 words because Deepgram refuses a request over 500 tokens.
+- The body is the file itself, read in blocks by `http.client` through a
+  wrapper that reports upload progress and raises on cancel. The request runs
+  on a worker thread so Cancel works while Deepgram is still thinking: the
+  caller stops waiting at once, and the reply is dropped when it arrives.
+- Each utterance becomes a segment, its text rebuilt from `punctuated_word`
+  so the word count matches the word timings and the reflow can cut lines at
+  real word boundaries. A reply without utterances is split at 0.8 s pauses.
+- Errors: 401/403 → `DeepgramKeyRejectedError`, 402 → `DeepgramCreditError`,
+  400 → `DeepgramRequestError` carrying Deepgram's `err_msg`, 504 →
+  `DeepgramTimeoutError` (not retried: the same audio times out again),
+  429/5xx/unreachable → retryable `DeepgramUnavailableError`.
+- The key ([app/core/deepgram_key.py](../app/core/deepgram_key.py)) comes
+  from `CAPTIONFORGE_DEEPGRAM_API_KEY` / `DEEPGRAM_API_KEY`, then `.env`, then
+  `deepgram.key` beside `config.json`, written through `mkstemp` so it is mode
+  0600 from the first byte. It is not a `Config` field, so `config show` and
+  `persist` cannot leak it, and interfaces only ever see its last four
+  characters. `check_and_save_key` asks Deepgram (`GET /v1/projects`) before
+  saving: 401 refuses, 403 still counts as a real key, offline saves it
+  unchecked.
 
 ### Whisper adapter ([app/adapters/whisper_adapter.py](../app/adapters/whisper_adapter.py))
 
@@ -713,7 +755,9 @@ or `CAPTIONFORGE_INTEGRATION_AUDIO` (real Whisper); run them with
 
 Offline testing is possible because every external boundary is injectable:
 `YtDlpAdapter(extractor_factory=…)`, `FFmpegAdapter(runner=…)`,
-`WhisperAdapter(model_factory=…, cuda_detector=…)`, and `retry_call(sleep=…)`.
+`WhisperAdapter(model_factory=…, cuda_detector=…)`, `DeepgramAdapter(opener=…)`,
+and `retry_call(sleep=…)`. One Deepgram test runs a real HTTP server on
+`127.0.0.1` to prove the upload streams whole; none reaches Deepgram.
 
 ---
 
@@ -748,8 +792,6 @@ Rough edges in the current code, worth knowing:
   contradicts the "raw yt-dlp text never reaches stdout" guarantee; those paths
   do not set `noprogress`. `download_media` does set it, so whole-file
   downloads report only CaptionForge's own progress.
-- `FFmpegAdapter.build_conversion_command` has a `codec = "pcm_s16le" if … else
-  "pcm_s16le"` branch; `audio_format` only affects the file extension.
 - `configure_logging`'s docstring mentions console and file handlers, but only
   the file handler is registered.
 - The `clean` command builds a `VideoMetadata` for the input file so it can

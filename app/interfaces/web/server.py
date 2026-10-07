@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.requests import ClientDisconnect
 
 from app.adapters import package_updater
+from app.adapters.deepgram_adapter import DeepgramAdapter, check_and_save_key
 from app.adapters.whisper_adapter import CudaStatus
 from app.core.config import Config
 from app.core.constants import (
@@ -22,6 +23,7 @@ from app.core.constants import (
     SUPPORTED_OUTPUT_FORMATS,
     VERSION,
 )
+from app.core.deepgram_key import describe_key, forget_key, key_path, load_key
 from app.core.exceptions import CaptionForgeError
 from app.core.logging_config import get_logger
 from app.interfaces.web import errors
@@ -33,6 +35,7 @@ from app.interfaces.web.preferences import (
     save_preferences,
 )
 from app.interfaces.web.schemas import (
+    DeepgramKeyBody,
     InspectRequest,
     JobRequestBody,
     MediaJobRequestBody,
@@ -64,8 +67,10 @@ def create_app(
     token: str,
     port: int,
     preferences_file: Path | None = None,
+    deepgram: DeepgramAdapter | None = None,
 ) -> FastAPI:
     """Build the local application with its job registry and guards."""
+    deepgram_adapter = deepgram or DeepgramAdapter()
     registry = JobRegistry(config)
     uploads = UploadStore(config.temp_directory, config.minimum_free_disk_bytes)
 
@@ -120,8 +125,13 @@ def create_app(
             # What the file chooser lists, beside anything the system calls
             # audio or video.
             "local_media_extensions": list(LOCAL_MEDIA_EXTENSIONS),
+            "default_engine": config.transcription_engine,
             "default_model": config.default_whisper_model,
+            "default_deepgram_model": config.deepgram_model,
             "default_device": config.whisper_device,
+            # Whether a key is there, where from, and its last four characters.
+            # The key itself never leaves the server.
+            "deepgram": _deepgram_status(),
             **_cuda_status(),
             "output_directory": str(config.default_output_folder.resolve()),
         }
@@ -131,6 +141,23 @@ def create_app(
         """Remember the current choices for the next session."""
         save_preferences(body, preferences_file)
         return resolve(body, config)
+
+    @application.put("/api/deepgram-key")
+    def write_deepgram_key(body: DeepgramKeyBody) -> dict[str, object]:
+        """Check a pasted key with Deepgram, then keep it where only this user reads.
+
+        A plain ``def``: the check is a network round trip, which must not hold
+        up the event loop. Offline, the key is saved unchecked and the reply
+        says so, because the person may well be about to go back online.
+        """
+        _, verdict = check_and_save_key(body.key, deepgram_adapter)
+        return {**_deepgram_status(), "checked": verdict is True}
+
+    @application.delete("/api/deepgram-key")
+    async def delete_deepgram_key() -> dict[str, object]:
+        """Forget the saved key. One set in the environment stays in charge."""
+        forget_key()
+        return _deepgram_status()
 
     @application.post("/api/inspect")
     async def inspect(body: InspectRequest) -> dict[str, object]:
@@ -188,6 +215,7 @@ def create_app(
                 url=body.url,
                 language=body.language,
                 formats=body.formats,
+                engine=body.engine,
                 model=body.model,
                 device=body.device,
                 compute_type=body.compute_type,
@@ -284,6 +312,14 @@ def _sources_in_use(registry: JobRegistry) -> set[Path]:
         if source is not None:
             sources.add(source)
     return sources
+
+
+def _deepgram_status() -> dict[str, object]:
+    """What the page may know about the Deepgram key, and where it would live."""
+    return {
+        **describe_key(load_key()),
+        "location": str(key_path().parent),
+    }
 
 
 def _cuda_status() -> dict[str, object]:

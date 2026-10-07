@@ -8,7 +8,12 @@ from typing import Any, ClassVar
 from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.core.constants import ENV_FILE, ENV_PREFIX, SUPPORTED_OUTPUT_FORMATS
+from app.core.constants import (
+    ENV_FILE,
+    ENV_PREFIX,
+    SUPPORTED_OUTPUT_FORMATS,
+    TRANSCRIPTION_ENGINES,
+)
 from app.core.exceptions import ConfigurationError
 
 
@@ -38,6 +43,11 @@ class Config(BaseModel):
     whisper_hallucination_silence_threshold: float | None = Field(default=None, ge=0)
     whisper_language: str | None = None
     whisper_model_download_directory: Path | None = None
+    # Which engine transcribes when no caption track is reused. Whisper runs on
+    # this computer; Deepgram uploads the audio to Deepgram's servers, so it is
+    # only ever used when someone picks it.
+    transcription_engine: str = "whisper"
+    deepgram_model: str = Field(default="nova-3", min_length=1)
     logging_level: str = "INFO"
     temp_directory: Path = Path("temp")
     keep_temp_files: bool = False
@@ -84,6 +94,8 @@ class Config(BaseModel):
             "whisper_hallucination_silence_threshold",
             "whisper_language",
             "whisper_model_download_directory",
+            "transcription_engine",
+            "deepgram_model",
             "logging_level",
             "temp_directory",
             "keep_temp_files",
@@ -126,6 +138,16 @@ class Config(BaseModel):
         normalized = value.lower()
         if normalized not in {"auto", "cpu", "cuda"}:
             raise ValueError("whisper_device must be auto, cpu, or cuda")
+        return normalized
+
+    @field_validator("transcription_engine")
+    @classmethod
+    def validate_transcription_engine(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in TRANSCRIPTION_ENGINES:
+            raise ValueError(
+                f"transcription_engine must be one of {sorted(TRANSCRIPTION_ENGINES)}"
+            )
         return normalized
 
     @field_validator("whisper_compute_type")

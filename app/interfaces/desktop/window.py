@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QBoxLayout,
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
     QLabel,
@@ -47,14 +48,17 @@ from PySide6.QtWidgets import (
 )
 
 from app.adapters import package_updater
+from app.adapters.deepgram_adapter import check_and_save_key
 from app.adapters.whisper_adapter import CudaStatus
 from app.core.config import Config
 from app.core.constants import (
     APP_NAME,
+    DEEPGRAM_UPLOAD_BITRATE_KBPS,
     LOCAL_MEDIA_EXTENSIONS,
     SUPPORTED_OUTPUT_FORMATS,
     VERSION,
 )
+from app.core.deepgram_key import DeepgramKey, forget_key, load_key
 from app.core.exceptions import CaptionForgeError
 from app.core.logging_config import get_logger
 from app.interfaces.desktop.background import run_in_background
@@ -112,7 +116,38 @@ WHISPER_MODELS: tuple[tuple[str, str, str], ...] = (
     ("medium", "Medium", "~1.5 GB"),
     ("large-v3", "Large v3", "~3 GB · slowest, most accurate"),
 )
-CUSTOM_MODEL = ("", "Something else", "A model name or a folder on this computer")
+# Only models that take every language the window is likely to be asked for;
+# any other one is a name away under "Something else".
+DEEPGRAM_MODELS: tuple[tuple[str, str, str], ...] = (
+    ("nova-3", "Nova-3", "newest, most languages"),
+)
+CUSTOM_MODEL = ("", "Something else…", "")
+
+ENGINES: tuple[tuple[str, str, str], ...] = (
+    ("whisper", "Whisper", "this computer"),
+    ("deepgram", "Deepgram", "online"),
+)
+# The audio goes up as mono Opus at this rate, so the upload is this per second.
+DEEPGRAM_BYTES_PER_SECOND = DEEPGRAM_UPLOAD_BITRATE_KBPS * 1000 / 8
+
+HINTS = {
+    "whisper": "CaptionForge reuses a video's own captions when there are any, "
+    "and transcribes the audio on this computer when there aren't.",
+    "deepgram": "CaptionForge reuses a video's own captions when there are any, "
+    "and has Deepgram transcribe the audio when there aren't.",
+}
+FILES_TOO = (
+    " Video and audio files work too: choose one, drop it here, or paste its path."
+)
+PROMPT_HELP = {
+    "whisper": "Whisper reads this before it listens, so unusual words come out "
+    "spelled the way you write them here. Write the names as you want them to "
+    "appear, separated by commas. It is a hint, not a filter: nothing is "
+    "dropped for being absent from the list.",
+    "deepgram": "Deepgram is sent these as key terms, so unusual words come out "
+    "spelled the way you write them here. Separate them with commas. It is a "
+    "hint, not a filter: nothing is dropped for being absent from the list.",
+}
 
 DEVICES: tuple[tuple[str, str, str], ...] = (
     ("auto", "Automatic", "Graphics card when it works, otherwise the processor"),
@@ -189,6 +224,11 @@ class Services:
     fetch: Callable[[str], bytes]
     open_path: Callable[[Path], bool]
     choose_file: Callable[[QWidget, str], str | None]
+    # The Deepgram key: find it, check and save a pasted one, forget it. Each
+    # answers with the key the window may now use, if any.
+    deepgram_key: Callable[[], DeepgramKey | None]
+    save_deepgram_key: Callable[[str], tuple[DeepgramKey, bool | None]]
+    forget_deepgram_key: Callable[[], DeepgramKey | None]
 
     @classmethod
     def for_config(cls, config: Config) -> Services:
@@ -199,6 +239,11 @@ class Services:
                 url, language, allow_translated=allow_translated
             )
 
+        def forget() -> DeepgramKey | None:
+            forget_key()
+            # One set in the environment is still in charge afterwards.
+            return load_key()
+
         return cls(
             inspect=inspect,
             updater=package_updater.UPDATER,
@@ -206,6 +251,9 @@ class Services:
             fetch=fetch_bytes,
             open_path=open_path,
             choose_file=choose_media_file,
+            deepgram_key=load_key,
+            save_deepgram_key=check_and_save_key,
+            forget_deepgram_key=forget,
         )
 
 
@@ -255,11 +303,11 @@ def results_heading(job: dict[str, Any]) -> str:
             if media.get("kind") == "audio"
             else f"Saved the video at {label}"
         )
-    return (
-        "Exported the video's own captions"
-        if job.get("used_existing_captions")
-        else "Transcribed on this computer"
-    )
+    if job.get("used_existing_captions"):
+        return "Exported the video's own captions"
+    if (job.get("transcription") or {}).get("engine") == "deepgram":
+        return "Transcribed by Deepgram"
+    return "Transcribed on this computer"
 
 
 def message_for(error: BaseException, context: str) -> str:
@@ -367,6 +415,13 @@ class MainWindow(QMainWindow):
         self._thumb_ticket = 0
         self._update_boxes: list[tuple[OptionCard, QCheckBox]] = []
         self._file_folder: Path | None = None
+        # "whisper" or "deepgram", and the model last picked for each, so
+        # switching engines never loses the other one's choice.
+        self._engine = "whisper"
+        self._models: dict[str, str] = {}
+        self._deepgram_key: DeepgramKey | None = None
+        # False only right after a key was saved without Deepgram answering.
+        self._key_checked: bool | None = None
 
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(POLL_INTERVAL_MS)
@@ -402,11 +457,7 @@ class MainWindow(QMainWindow):
         self.page = Page()
         main = self.page.main
         main.addWidget(self._build_source())
-        self.hint = Label(
-            "CaptionForge reuses a video's own captions when there are any, and "
-            "transcribes the audio on this computer when there aren't. Video and "
-            "audio files work too: choose one, drop it here, or paste its path."
-        )
+        self.hint = Label(HINTS["whisper"] + FILES_TOO)
         main.addWidget(self.hint)
         main.addWidget(self._build_alert())
         main.addWidget(self._build_updates())
@@ -558,8 +609,9 @@ class MainWindow(QMainWindow):
         fields.addLayout(language_field)
         fields.addLayout(formats_field, 1)
         layout.addLayout(fields)
+        layout.addWidget(self._build_engine())
 
-        self.options = Disclosure("Options", self._build_options())
+        self.options = Disclosure("More options", self._build_options())
         layout.addWidget(self.options)
 
         self.run_button = Button("Get captions", "go")
@@ -569,10 +621,65 @@ class MainWindow(QMainWindow):
         self.controls.hide()
         return self.controls
 
+    def _build_engine(self) -> QWidget:
+        """Transcribe with: the engine, its model, the key, and the override.
+
+        These are the choices people change most, so they sit in the card
+        itself rather than behind More options.
+        """
+        block = QWidget()
+        layout = column(10)
+        layout.addWidget(SectionLabel("Transcribe with"))
+        self.engines = Chips()
+        layout.addWidget(self.engines)
+        self.model = QComboBox()
+        self.model.setCursor(Qt.CursorShape.PointingHandCursor)
+        layout.addWidget(self.model)
+        self.model_custom = QLineEdit()
+        self.model_custom.hide()
+        layout.addWidget(self.model_custom)
+
+        self.key_row = QWidget()
+        self._key_layout = row(10)
+        self.deepgram_key = QLineEdit()
+        self.deepgram_key.setObjectName("deepgram-key")
+        self.deepgram_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.deepgram_key.setAccessibleName("Deepgram API key")
+        self.deepgram_key.setPlaceholderText("Paste your Deepgram API key")
+        self.deepgram_key.returnPressed.connect(self.save_key)
+        self.key_save = Button("Save", "ghost")
+        on_click(self.key_save, self.save_key)
+        self._key_layout.addWidget(self.deepgram_key, 1)
+        self._key_layout.addWidget(self.key_save)
+        self.key_row.setLayout(self._key_layout)
+        self.key_row.hide()
+        layout.addWidget(self.key_row)
+
+        self.key_saved = QWidget()
+        saved = row(10)
+        self.key_saved_text = Label(wrap=False)
+        self.key_saved_text.setObjectName("key-saved-text")
+        self.key_forget = Button("Forget", "quiet")
+        self.key_forget.setProperty("size", "small")
+        on_click(self.key_forget, self.forget_key)
+        saved.addWidget(self.key_saved_text)
+        saved.addWidget(self.key_forget)
+        saved.addStretch(1)
+        self.key_saved.setLayout(saved)
+        self.key_saved.hide()
+        layout.addWidget(self.key_saved)
+
+        self.engine_help = Label(role="help")
+        layout.addWidget(self.engine_help)
+        self.force = QCheckBox("Transcribe even when the video has captions")
+        self.force.setCursor(Qt.CursorShape.PointingHandCursor)
+        layout.addWidget(self.force)
+        block.setLayout(layout)
+        return block
+
     def _build_options(self) -> QWidget:
         body = QWidget()
         grid = column(10)
-        self.force = QCheckBox("Always transcribe, ignore existing captions")
         self.allow_translated = QCheckBox("Accept machine-translated tracks")
         self.timestamped = QCheckBox("Timestamps in the TXT file")
         self.overwrite = QCheckBox("Replace files instead of numbering them")
@@ -580,7 +687,6 @@ class MainWindow(QMainWindow):
         self.postprocess.setChecked(True)
         self.keep_audio = QCheckBox("Keep the prepared audio")
         for box in (
-            self.force,
             self.allow_translated,
             self.timestamped,
             self.overwrite,
@@ -590,30 +696,7 @@ class MainWindow(QMainWindow):
             box.setCursor(Qt.CursorShape.PointingHandCursor)
             grid.addWidget(box)
 
-        models = column(0)
-        models.addWidget(SectionLabel("Whisper model"))
-        self.model_list = column(6)
-        self.model_group = QButtonGroup(self)
-        models.addLayout(self.model_list)
-        self.model_custom = QLineEdit()
-        self.model_custom.setAccessibleName("Custom model name or folder")
-        self.model_custom.setPlaceholderText(
-            "Model name or folder, e.g. tarteel-ai/whisper-base-ar-quran"
-        )
-        self.model_custom.hide()
-        models.addSpacing(8)
-        models.addWidget(self.model_custom)
-        models.addSpacing(7)
-        models.addWidget(
-            Label(
-                "Only used when the video has no caption track to reuse. Bigger "
-                "models are more accurate and slower, and each one downloads once "
-                "the first time you pick it.",
-                role="help",
-            )
-        )
-        grid.addLayout(models)
-
+        self.device_block = QWidget()
         devices = column(0)
         devices.addWidget(SectionLabel("Device"))
         device_list = column(6)
@@ -628,7 +711,8 @@ class MainWindow(QMainWindow):
             device_list.addWidget(card)
         self.device_cards["auto"].indicator.setChecked(True)
         devices.addLayout(device_list)
-        grid.addLayout(devices)
+        self.device_block.setLayout(devices)
+        grid.addWidget(self.device_block)
 
         names = column(0)
         names.addWidget(SectionLabel("Names and spellings"))
@@ -637,15 +721,8 @@ class MainWindow(QMainWindow):
         self.prompt.setPlaceholderText("Speaker names, places, recurring terms")
         names.addWidget(self.prompt)
         names.addSpacing(7)
-        names.addWidget(
-            Label(
-                "Whisper reads this before it listens, so unusual words come out "
-                "spelled the way you write them here. Write the names as you want "
-                "them to appear, separated by commas. It is a hint, not a filter: "
-                "nothing is dropped for being absent from the list.",
-                role="help",
-            )
-        )
+        self.prompt_help = Label(PROMPT_HELP["whisper"], role="help")
+        names.addWidget(self.prompt_help)
         grid.addLayout(names)
         body.setLayout(grid)
         return body
@@ -689,12 +766,14 @@ class MainWindow(QMainWindow):
         return self.results
 
     def _narrow(self, narrow: bool) -> None:
-        """``@media (max-width: 33rem) { .source { flex-direction: column } }``."""
-        self._source_layout.setDirection(
+        """``@media (max-width: 33rem) { .source, .key-row { … column } }``."""
+        direction = (
             QBoxLayout.Direction.TopToBottom
             if narrow
             else QBoxLayout.Direction.LeftToRight
         )
+        self._source_layout.setDirection(direction)
+        self._key_layout.setDirection(direction)
 
     # ---------- startup ----------
 
@@ -730,15 +809,24 @@ class MainWindow(QMainWindow):
             # Cleaning subtitles is on unless it was explicitly turned off.
             self.postprocess.setChecked(saved.get("postprocess") is not False)
             self._chosen_formats = set(self._initial_formats())
+            self._engine = (
+                "deepgram" if saved.get("engine") == "deepgram" else "whisper"
+            )
+            self._models = {
+                "whisper": saved.get("model") or self._config.default_whisper_model,
+                "deepgram": saved.get("deepgram_model") or self._config.deepgram_model,
+            }
+            self._deepgram_key = self._services.deepgram_key()
             self._render_formats()
+            self._render_engines()
             self._render_models()
             self._select_device(saved.get("device") or self._config.whisper_device)
+            self._sync_engine()
         finally:
             self._restoring = False
         # Options that differ from the defaults are worth showing on arrival.
         if (
-            self.force.isChecked()
-            or self.overwrite.isChecked()
+            self.overwrite.isChecked()
             or self.keep_audio.isChecked()
             or self.timestamped.isChecked()
             or self.allow_translated.isChecked()
@@ -772,27 +860,205 @@ class MainWindow(QMainWindow):
         chip.set_picked(name in self._chosen_formats)
         self.remember_choices()
 
-    def _render_models(self) -> None:
-        wanted = self._preferences.get("model") or self._config.default_whisper_model
-        known = any(value == wanted for value, _, _ in WHISPER_MODELS)
-        for value, name, note in (*WHISPER_MODELS, CUSTOM_MODEL):
-            radio = QRadioButton()
-            radio.setProperty("value", value)
-            self.model_group.addButton(radio)
-            self.model_list.addWidget(OptionCard(radio, name, note))
-            radio.setChecked((not known) if value == "" else value == wanted)
-        self.model_custom.setVisible(not known)
-        if not known:
-            self.model_custom.setText(wanted)
-        self.model_group.buttonToggled.connect(self._model_toggled)
+    # ---------- engine and model ----------
 
-    def _model_toggled(self, button: QRadioButton, checked: bool) -> None:
-        if not checked:
+    def _render_engines(self) -> None:
+        self.engines.clear()
+        for value, name, kind in ENGINES:
+            chip = Chip(name, kind)
+            chip.setProperty("value", value)
+            chip.set_picked(value == self._engine)
+            on_click(chip, partial(self.pick_engine, value))
+            self.engines.add(chip)
+
+    def pick_engine(self, engine: str) -> None:
+        """Switch engines; each one keeps the model it had."""
+        if engine == self._engine:
             return
-        custom = button.property("value") == ""
+        self._remember_model()
+        self._engine = engine
+        for chip in self.engines.chips():
+            chip.set_picked(chip.property("value") == engine)
+        self._restoring = True
+        try:
+            self._render_models()
+        finally:
+            self._restoring = False
+        self._sync_engine()
+        self.remember_choices()
+
+    def _render_models(self) -> None:
+        deepgram = self._engine == "deepgram"
+        models = DEEPGRAM_MODELS if deepgram else WHISPER_MODELS
+        wanted = self._models.get(self._engine, "")
+        known = any(value == wanted for value, _, _ in models)
+        self.model.blockSignals(True)
+        self.model.clear()
+        for value, name, note in (*models, CUSTOM_MODEL):
+            self.model.addItem(f"{name} — {note}" if note else name, value)
+        self.model.setCurrentIndex(
+            next(
+                index
+                for index in range(self.model.count())
+                if self.model.itemData(index) == (wanted if known else "")
+            )
+        )
+        self.model.blockSignals(False)
+        self.model.setAccessibleName("Deepgram model" if deepgram else "Whisper model")
+        self.model_custom.setAccessibleName(
+            "Custom Deepgram model" if deepgram else "Custom model name or folder"
+        )
+        self.model_custom.setPlaceholderText(
+            "A Deepgram model, e.g. nova-3-medical"
+            if deepgram
+            else "Model name or folder, e.g. tarteel-ai/whisper-base-ar-quran"
+        )
+        self.model_custom.setText("" if known else wanted)
+        self.model_custom.setVisible(not known)
+
+    def _model_changed(self, _index: int) -> None:
+        custom = not self.model.currentData()
         self.model_custom.setVisible(custom)
         if custom:
             self.model_custom.setFocus()
+        self._remember_model()
+        self.remember_choices()
+
+    def _remember_model(self) -> dict[str, str]:
+        """Note the outgoing engine's pick before its list is redrawn."""
+        picked = self.chosen_model()
+        if picked:
+            self._models[self._engine] = picked
+        return dict(self._models)
+
+    def _sync_engine(self) -> None:
+        deepgram = self._engine == "deepgram"
+        # The graphics card is Whisper's business; Deepgram brings its own.
+        self.device_block.setVisible(not deepgram)
+        self.hint.setText(HINTS[self._engine] + FILES_TOO)
+        self.prompt_help.setText(PROMPT_HELP[self._engine])
+        self._render_key()
+        self._sync_transcription_wording()
+
+    def _sync_transcription_wording(self) -> None:
+        """Every sentence near the button says what a click will really do."""
+        deepgram = self._engine == "deepgram"
+        result = self._inspection
+        video = result.discovery.video if result is not None else None
+        local = video is not None and video.is_local
+        forced = self.force.isChecked() and not local
+        if deepgram:
+            seconds = video.duration_seconds if video is not None else None
+            upload = (
+                f" (~{format_size(round(seconds * DEEPGRAM_BYTES_PER_SECOND))} "
+                "for this one)"
+                if seconds
+                else ""
+            )
+            self.engine_help.setText(
+                f"Sends a compressed copy of the audio to Deepgram{upload}, on "
+                "your Deepgram account. Nothing else leaves this computer."
+            )
+        else:
+            self.engine_help.setText(
+                "Runs on this computer. Bigger models are more accurate and "
+                "slower, and each one downloads once the first time you pick it."
+            )
+        if result is None:
+            return
+        discovery = result.discovery
+        track = None if local else discovery.selected_track
+        engine = "Deepgram" if deepgram else "Whisper"
+        if track is not None and forced:
+            self.selection.setText(
+                f"Will transcribe with {engine} instead of exporting the "
+                "highlighted track."
+            )
+        elif track is not None:
+            self.selection.setText(
+                f"Will export the highlighted track "
+                f"({discovery.selection_reason or 'preferred match'})."
+            )
+        else:
+            self.selection.setText(
+                "No matching track, so Deepgram will transcribe the audio."
+                if deepgram
+                else "No matching track, so the audio will be transcribed on "
+                "this computer."
+            )
+        self.run_button.setText("Transcribe" if local or forced else "Get captions")
+
+    def _transcribes(self) -> bool:
+        """Whether a click on the button will need an engine at all."""
+        result = self._inspection
+        if result is None or result.discovery.video.is_local:
+            return True
+        return result.discovery.selected_track is None or self.force.isChecked()
+
+    # ---------- the Deepgram key ----------
+
+    def _render_key(self) -> None:
+        deepgram = self._engine == "deepgram"
+        key = self._deepgram_key
+        self.key_row.setVisible(deepgram and key is None)
+        self.key_saved.setVisible(deepgram and key is not None)
+        if key is None:
+            return
+        where = "set in the environment" if key.source == "environment" else "saved"
+        unchecked = ", not checked yet" if self._key_checked is False else ""
+        self.key_saved_text.setText(f"Deepgram key {key.hint} {where}{unchecked}")
+        # A key from the environment is not the window's to remove.
+        self.key_forget.setVisible(key.source != "environment")
+
+    def save_key(self) -> None:
+        """Check the pasted key with Deepgram, then keep it for next time."""
+        value = self.deepgram_key.text().strip()
+        if not value:
+            self.deepgram_key.setFocus()
+            return
+        if self._running:
+            return
+        self.clear_alert()
+        self.key_save.setEnabled(False)
+        self.key_save.setText("Checking…")
+
+        def settle() -> None:
+            self.key_save.setEnabled(not self._running)
+            self.key_save.setText("Save")
+
+        def saved(answer: tuple[DeepgramKey, bool | None]) -> None:
+            settle()
+            self._deepgram_key, verdict = answer
+            self._key_checked = verdict is True
+            self.deepgram_key.clear()
+            self._render_key()
+
+        def failed(error: BaseException) -> None:
+            settle()
+            self.show_alert("Could not save the key", message_for(error, "key"))
+
+        save = self._services.save_deepgram_key
+        run_in_background(
+            lambda: save(value),
+            saved,
+            failed,
+            parent=self,
+            name="captionforge-deepgram-key",
+        )
+
+    def forget_key(self) -> None:
+        """Remove the saved key; the field to paste one comes back."""
+        if self._running:
+            return
+        try:
+            self._deepgram_key = self._services.forget_deepgram_key()
+        except Exception as exc:  # noqa: BLE001 - shown, never raised
+            self.show_alert("Could not forget the key", message_for(exc, "key"))
+            return
+        self._key_checked = None
+        self._render_key()
+        if not self.key_row.isHidden():
+            self.deepgram_key.setFocus()
 
     def _select_device(self, wanted: str) -> None:
         card = self.device_cards.get(wanted)
@@ -820,6 +1086,7 @@ class MainWindow(QMainWindow):
 
     def current_preferences(self) -> dict[str, Any]:
         """The choices on screen, in the shape the preferences file stores."""
+        models = self._remember_model()
         return {
             "language": self.language.text().strip() or None,
             "formats": [
@@ -827,7 +1094,9 @@ class MainWindow(QMainWindow):
                 for name in sorted(SUPPORTED_OUTPUT_FORMATS)
                 if name in self._chosen_formats
             ],
-            "model": self.chosen_model(),
+            "engine": self._engine,
+            "model": models.get("whisper"),
+            "deepgram_model": models.get("deepgram"),
             "device": self.chosen_device(),
             "prompt": self.prompt.text().strip() or None,
             "force": self.force.isChecked(),
@@ -870,8 +1139,9 @@ class MainWindow(QMainWindow):
             self.keep_audio,
         ):
             box.toggled.connect(lambda _checked: self.remember_choices())
-        for group in (self.model_group, self.device_group):
-            group.buttonToggled.connect(self._choice_toggled)
+        self.force.toggled.connect(lambda _checked: self._sync_transcription_wording())
+        self.model.currentIndexChanged.connect(self._model_changed)
+        self.device_group.buttonToggled.connect(self._choice_toggled)
 
     def _choice_toggled(self, _button: QRadioButton, checked: bool) -> None:
         # A radio group reports the one it unchecked too; save once, not twice.
@@ -880,11 +1150,12 @@ class MainWindow(QMainWindow):
 
     def chosen_model(self) -> str | None:
         """The picked model's name, or the custom one typed in."""
-        picked = self.model_group.checkedButton()
-        if picked is None:
-            return None
-        value = str(picked.property("value"))
-        return value or self.model_custom.text().strip() or None
+        value = self.model.currentData()
+        return str(value) if value else (self.model_custom.text().strip() or None)
+
+    def chosen_engine(self) -> str:
+        """whisper or deepgram."""
+        return self._engine
 
     def chosen_device(self) -> str | None:
         """auto, cuda or cpu."""
@@ -909,6 +1180,8 @@ class MainWindow(QMainWindow):
         self.inspect_button.setEnabled(not busy)
         self.choose_button.setEnabled(not busy)
         self.run_button.setEnabled(not busy)
+        self.key_save.setEnabled(not busy)
+        self.key_forget.setEnabled(not busy)
         # One click starts a download, so every other one has to stop working
         # while a job runs: two writes to the output folder at once help nobody.
         for chip in self.media_list.chips():
@@ -943,6 +1216,7 @@ class MainWindow(QMainWindow):
         )
 
     def _inspected(self, url: str, result: VideoInspection) -> None:
+        # Kept before rendering: the wording near the button reads it.
         self._inspection = result
         self._inspected_url = url
         self.set_busy(False)
@@ -1058,19 +1332,13 @@ class MainWindow(QMainWindow):
             on_click(more, expand)
             self.track_list.add(more)
 
-        self.selection.setText(
-            f"Will export the highlighted track "
-            f"({discovery.selection_reason or 'preferred match'})."
-            if selected
-            else "No matching track, so the audio will be transcribed on this computer."
-        )
         # A file has no published tracks to list, and is always transcribed, so
         # the button says so and the two caption-track options step aside.
         local = video.is_local
         self.tracks.setVisible(not local)
         self.force.setVisible(not local)
         self.allow_translated.setVisible(not local)
-        self.run_button.setText("Transcribe" if local else "Get captions")
+        self._sync_transcription_wording()
         self.controls.show()
 
     def _fetch_thumbnail(self, url: str, ticket: int) -> None:
@@ -1176,6 +1444,18 @@ class MainWindow(QMainWindow):
             return
         if self._running:
             return
+        if (
+            self._engine == "deepgram"
+            and self._deepgram_key is None
+            and self._transcribes()
+        ):
+            self.show_alert(
+                "Add a Deepgram key",
+                "Paste your Deepgram API key and save it, or pick Whisper to "
+                "transcribe on this computer.",
+            )
+            self.deepgram_key.setFocus()
+            return
         self.clear_alert()
         self.results.hide()
         self.set_busy(True)
@@ -1189,7 +1469,8 @@ class MainWindow(QMainWindow):
                     url=self.url.text().strip(),
                     language=preferences["language"],
                     formats=tuple(preferences["formats"]),
-                    model=preferences["model"],
+                    engine=preferences["engine"],
+                    model=self.chosen_model(),
                     device=preferences["device"],
                     prompt=preferences["prompt"],
                     force=preferences["force"],
@@ -1285,10 +1566,14 @@ class MainWindow(QMainWindow):
                 if probability is not None
                 else ""
             )
+            engine = (
+                f"Deepgram {info['model_name']}"
+                if info.get("engine") == "deepgram"
+                else f"{info['model_name']} on {info['device']}"
+            )
             notes.append(
                 html.escape(
-                    f"{info['model_name']} on {info['device']}, "
-                    f"detected {info['detected_language']}{confident}"
+                    f"{engine}, detected {info['detected_language']}{confident}"
                 )
             )
         self.results_note.set_markup(" · ".join(notes))

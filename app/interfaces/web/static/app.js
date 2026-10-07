@@ -14,6 +14,26 @@
     { value: "medium", label: "Medium", note: "~1.5 GB" },
     { value: "large-v3", label: "Large v3", note: "~3 GB · slowest, most accurate" },
   ];
+  // Only models that take every language this page is likely to be asked
+  // for; any other one is a name away under "Something else".
+  const DEEPGRAM_MODELS = [
+    { value: "nova-3", label: "Nova-3", note: "newest, most languages" },
+  ];
+  const CUSTOM_MODEL = { value: "", label: "Something else…" };
+  const ENGINES = [
+    { value: "whisper", label: "Whisper", kind: "this computer" },
+    { value: "deepgram", label: "Deepgram", kind: "online" },
+  ];
+  // The server uploads mono Opus at 48 kbps, so the upload is this per second.
+  const DEEPGRAM_BYTES_PER_SECOND = 48000 / 8;
+  const HINTS = {
+    whisper: "CaptionForge reuses a video's own captions when there are any, " +
+      "and transcribes the audio on this computer when there aren't.",
+    deepgram: "CaptionForge reuses a video's own captions when there are any, " +
+      "and has Deepgram transcribe the audio when there aren't.",
+  };
+  const FILES_TOO = " Video and audio files work too: choose one, drop it here, " +
+    "or paste its path.";
   const TERMINAL = new Set(["completed", "failed", "cancelled"]);
 
   const el = (id) => document.getElementById(id);
@@ -34,12 +54,19 @@
     progress: el("progress"), stage: el("stage"), pct: el("pct"), fill: el("fill"),
     results: el("results"), resultsLabel: el("results-label"),
     files: el("files"), resultsNote: el("results-note"),
-    force: el("force"), allowTranslated: el("allow-translated"),
+    force: el("force"), forceRow: el("force-row"),
+    allowTranslated: el("allow-translated"),
     timestamped: el("timestamped-txt"), overwrite: el("overwrite"),
     postprocess: el("postprocess"), keepAudio: el("keep-audio"),
-    models: el("models"), modelCustom: el("model-custom"),
+    engines: el("engines"), model: el("model"), modelCustom: el("model-custom"),
+    engineHelp: el("engine-help"),
+    keyRow: el("key-row"), deepgramKey: el("deepgram-key"), keySave: el("key-save"),
+    keySaved: el("key-saved"), keySavedText: el("key-saved-text"),
+    keyForget: el("key-forget"),
+    deviceBlock: el("device-block"),
     deviceCuda: el("device-cuda"), cudaNote: el("cuda-note"),
-    prompt: el("prompt"), optionsPanel: el("options-panel"),
+    prompt: el("prompt"), promptHelp: el("prompt-help"),
+    optionsPanel: el("options-panel"),
   };
 
   const state = {
@@ -57,6 +84,13 @@
     // of CaptionForge's copy, which is what actually gets looked up.
     upload: null,
     copying: null,
+    // "whisper" or "deepgram", and the model last picked for each, so
+    // switching engines never loses the other one's choice.
+    engine: "whisper",
+    models: { whisper: null, deepgram: null },
+    // Whether a Deepgram key is saved, where from, and its last four
+    // characters. The page never holds the key itself once it is saved.
+    deepgram: { saved: false },
   };
 
   /* ---------- token ---------- */
@@ -122,6 +156,8 @@
     ui.inspect.disabled = isBusy;
     ui.choose.disabled = isBusy;
     ui.run.disabled = isBusy;
+    ui.keySave.disabled = isBusy;
+    ui.keyForget.disabled = isBusy;
     // One click starts a download, so every other one has to stop working
     // while a job runs: two writes to the output folder at once help nobody.
     for (const chip of ui.mediaList.querySelectorAll("button")) {
@@ -191,11 +227,19 @@
     // Cleaning subtitles is on unless it was explicitly turned off.
     ui.postprocess.checked = saved.postprocess !== false;
     state.chosenFormats = new Set(initialFormats());
+    state.engine = saved.engine === "deepgram" ? "deepgram" : "whisper";
+    state.models = {
+      whisper: saved.model || state.defaults.default_model || "small",
+      deepgram: saved.deepgram_model || state.defaults.default_deepgram_model || "nova-3",
+    };
+    state.deepgram = state.defaults.deepgram || { saved: false };
     renderFormats();
+    renderEngines();
     renderModels();
     applyDeviceAvailability();
+    syncEngine();
     // Options that differ from the defaults are worth showing on arrival.
-    if (ui.force.checked || ui.overwrite.checked || ui.keepAudio.checked ||
+    if (ui.overwrite.checked || ui.keepAudio.checked ||
         ui.timestamped.checked || ui.allowTranslated.checked ||
         !ui.postprocess.checked || ui.prompt.value) {
       ui.optionsPanel.open = true;
@@ -205,10 +249,13 @@
   /* ---------- remembering ---------- */
 
   function currentPreferences() {
+    const models = rememberModel();
     return {
       language: ui.language.value.trim() || null,
       formats: [...state.chosenFormats],
-      model: chosenModel(),
+      engine: state.engine,
+      model: models.whisper,
+      deepgram_model: models.deepgram,
       device: chosenDevice(),
       prompt: ui.prompt.value.trim() || null,
       force: ui.force.checked,
@@ -239,41 +286,196 @@
     ui.controls.addEventListener("input", rememberChoices);
   }
 
-  function renderModels() {
-    const wanted = state.preferences.model || state.defaults.default_model;
-    const known = WHISPER_MODELS.some((entry) => entry.value === wanted);
-    const options = [
-      ...WHISPER_MODELS,
-      { value: "", label: "Something else", note: "A model name or a folder on this computer" },
-    ];
-    ui.models.replaceChildren();
-    for (const option of options) {
-      const isCustom = option.value === "";
-      const label = document.createElement("label");
-      label.className = "radio";
-      const input = document.createElement("input");
-      input.type = "radio";
-      input.name = "model";
-      input.value = option.value;
-      input.checked = isCustom ? !known : option.value === wanted;
-      input.addEventListener("change", () => {
-        ui.modelCustom.hidden = !isCustom;
-        if (isCustom) ui.modelCustom.focus();
-      });
-      const text = document.createElement("span");
-      const name = document.createElement("b");
-      name.textContent = option.label;
-      const note = document.createElement("em");
-      note.textContent = option.note;
-      text.append(name, note);
-      label.append(input, text);
-      ui.models.append(label);
-      if (input.checked && isCustom) {
-        ui.modelCustom.hidden = false;
-        ui.modelCustom.value = wanted;
-      }
+  /* ---------- engine and model ---------- */
+
+  function renderEngines() {
+    ui.engines.replaceChildren();
+    for (const engine of ENGINES) {
+      const item = document.createElement("li");
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chip";
+      chip.setAttribute("role", "radio");
+      const picked = state.engine === engine.value;
+      chip.setAttribute("aria-checked", String(picked));
+      chip.classList.toggle("picked", picked);
+      const name = document.createElement("span");
+      name.textContent = engine.label;
+      const kind = document.createElement("span");
+      kind.className = "kind";
+      kind.textContent = engine.kind;
+      chip.append(name, kind);
+      chip.addEventListener("click", () => pickEngine(engine.value));
+      item.append(chip);
+      ui.engines.append(item);
     }
   }
+
+  function pickEngine(engine) {
+    if (engine === state.engine) return;
+    rememberModel();
+    state.engine = engine;
+    renderEngines();
+    renderModels();
+    syncEngine();
+    rememberChoices();
+  }
+
+  function renderModels() {
+    const deepgram = state.engine === "deepgram";
+    const list = deepgram ? DEEPGRAM_MODELS : WHISPER_MODELS;
+    const wanted = state.models[state.engine];
+    const known = list.some((entry) => entry.value === wanted);
+    ui.model.replaceChildren();
+    for (const option of [...list, CUSTOM_MODEL]) {
+      const element = document.createElement("option");
+      element.value = option.value;
+      element.textContent = option.note ? `${option.label} — ${option.note}` : option.label;
+      element.selected = option.value === "" ? !known : option.value === wanted;
+      ui.model.append(element);
+    }
+    ui.model.setAttribute("aria-label", deepgram ? "Deepgram model" : "Whisper model");
+    ui.modelCustom.placeholder = deepgram
+      ? "A Deepgram model, e.g. nova-3-medical"
+      : "Model name or folder, e.g. tarteel-ai/whisper-base-ar-quran";
+    ui.modelCustom.hidden = known;
+    ui.modelCustom.value = known ? "" : (wanted || "");
+  }
+
+  ui.model.addEventListener("change", () => {
+    const custom = ui.model.value === "";
+    ui.modelCustom.hidden = !custom;
+    if (custom) ui.modelCustom.focus();
+    rememberModel();
+  });
+
+  function rememberModel() {
+    // Called before the list is redrawn, so the outgoing engine keeps its pick.
+    const picked = chosenModel();
+    if (picked) state.models[state.engine] = picked;
+    return { ...state.models };
+  }
+
+  function syncEngine() {
+    const deepgram = state.engine === "deepgram";
+    // The graphics card is Whisper's business; Deepgram brings its own.
+    ui.deviceBlock.hidden = deepgram;
+    ui.hint.textContent = HINTS[state.engine] + FILES_TOO;
+    ui.promptHelp.textContent = deepgram
+      ? "Deepgram is sent these as key terms, so unusual words come out " +
+        "spelled the way you write them here. Separate them with commas. " +
+        "It is a hint, not a filter: nothing is dropped for being absent " +
+        "from the list."
+      : "Whisper reads this before it listens, so unusual words come out " +
+        "spelled the way you write them here. Write the names as you want " +
+        "them to appear, separated by commas. It is a hint, not a filter: " +
+        "nothing is dropped for being absent from the list.";
+    renderKey();
+    syncTranscriptionWording();
+  }
+
+  function syncTranscriptionWording() {
+    // Every sentence near the button says what a click will really do.
+    const deepgram = state.engine === "deepgram";
+    const result = state.inspection;
+    const local = Boolean(result && result.video.local_path);
+    const forced = ui.force.checked && !local;
+    if (deepgram) {
+      const seconds = result && result.video.duration_seconds;
+      const upload = seconds
+        ? ` (~${formatSize(seconds * DEEPGRAM_BYTES_PER_SECOND)} for this one)`
+        : "";
+      ui.engineHelp.textContent =
+        `Sends a compressed copy of the audio to Deepgram${upload}, ` +
+        "on your Deepgram account. Nothing else leaves this computer.";
+    } else {
+      ui.engineHelp.textContent =
+        "Runs on this computer. Bigger models are more accurate and slower, " +
+        "and each one downloads once the first time you pick it.";
+    }
+    if (!result) return;
+    const track = local ? null : result.selected_track;
+    if (track && forced) {
+      ui.selection.textContent =
+        `Will transcribe with ${deepgram ? "Deepgram" : "Whisper"} instead of ` +
+        "exporting the highlighted track.";
+    } else if (track) {
+      ui.selection.textContent =
+        `Will export the highlighted track (${result.selection_reason || "preferred match"}).`;
+    } else {
+      ui.selection.textContent = deepgram
+        ? "No matching track, so Deepgram will transcribe the audio."
+        : "No matching track, so the audio will be transcribed on this computer.";
+    }
+    ui.run.textContent = local || forced ? "Transcribe" : "Get captions";
+  }
+
+  ui.force.addEventListener("change", syncTranscriptionWording);
+
+  function transcribes() {
+    // Whether a click on the button will need an engine at all.
+    const result = state.inspection;
+    if (!result || result.video.local_path) return true;
+    return !result.selected_track || ui.force.checked;
+  }
+
+  /* ---------- the Deepgram key ---------- */
+
+  function renderKey() {
+    const deepgram = state.engine === "deepgram";
+    const key = state.deepgram || { saved: false };
+    ui.keyRow.hidden = !deepgram || Boolean(key.saved);
+    ui.keySaved.hidden = !deepgram || !key.saved;
+    if (!key.saved) return;
+    const where = key.source === "environment" ? "set in the environment" : "saved";
+    const unchecked = key.checked === false ? ", not checked yet" : "";
+    ui.keySavedText.textContent = `Deepgram key ${key.hint} ${where}${unchecked}`;
+    // A key from the environment is not the page's to remove.
+    ui.keyForget.hidden = key.source === "environment";
+  }
+
+  async function saveKey() {
+    const key = ui.deepgramKey.value.trim();
+    if (!key) {
+      ui.deepgramKey.focus();
+      return;
+    }
+    if (state.running) return;
+    clearAlert();
+    ui.keySave.disabled = true;
+    ui.keySave.textContent = "Checking…";
+    try {
+      state.deepgram = await api("/api/deepgram-key", {
+        method: "PUT",
+        body: JSON.stringify({ key }),
+      });
+      ui.deepgramKey.value = "";
+      renderKey();
+    } catch (error) {
+      showAlert("Could not save the key", error.message);
+    } finally {
+      ui.keySave.disabled = state.running;
+      ui.keySave.textContent = "Save";
+    }
+  }
+
+  ui.keySave.addEventListener("click", saveKey);
+  ui.deepgramKey.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    saveKey();
+  });
+
+  ui.keyForget.addEventListener("click", async () => {
+    if (state.running) return;
+    try {
+      state.deepgram = await api("/api/deepgram-key", { method: "DELETE" });
+      renderKey();
+      if (!ui.keyRow.hidden) ui.deepgramKey.focus();
+    } catch (error) {
+      showAlert("Could not forget the key", error.message);
+    }
+  });
 
   function applyDeviceAvailability() {
     const wanted = state.preferences.device || state.defaults.default_device;
@@ -301,9 +503,7 @@
   }
 
   function chosenModel() {
-    const picked = document.querySelector('input[name="model"]:checked');
-    if (!picked) return null;
-    if (picked.value) return picked.value;
+    if (ui.model.value) return ui.model.value;
     return ui.modelCustom.value.trim() || null;
   }
 
@@ -561,16 +761,13 @@
       ui.trackList.append(item);
     }
 
-    ui.selection.textContent = result.selected_track
-      ? `Will export the highlighted track (${result.selection_reason || "preferred match"}).`
-      : "No matching track, so the audio will be transcribed on this computer.";
     // A file has no published tracks to list, and is always transcribed, so
     // the button says so and the two caption-track options step aside.
     const local = Boolean(video.local_path);
     ui.tracks.hidden = local;
-    ui.force.closest("label").hidden = local;
+    ui.forceRow.hidden = local;
     ui.allowTranslated.closest("label").hidden = local;
-    ui.run.textContent = local ? "Transcribe" : "Get captions";
+    syncTranscriptionWording();
     ui.controls.hidden = false;
   }
 
@@ -673,6 +870,15 @@
       showAlert("Pick a format", "Choose at least one output format.");
       return;
     }
+    if (state.engine === "deepgram" && !state.deepgram.saved && transcribes()) {
+      showAlert(
+        "Add a Deepgram key",
+        "Paste your Deepgram API key and save it, or pick Whisper to " +
+        "transcribe on this computer."
+      );
+      ui.deepgramKey.focus();
+      return;
+    }
     clearAlert();
     ui.results.hidden = true;
     busy(true);
@@ -686,6 +892,7 @@
           url: sourceValue(),
           language: ui.language.value.trim() || null,
           formats: [...state.chosenFormats],
+          engine: state.engine,
           model: chosenModel(),
           device: chosenDevice(),
           prompt: ui.prompt.value.trim() || null,
@@ -796,9 +1003,10 @@
       const probability = info.language_probability !== null
         ? ` (${Math.round(info.language_probability * 100)}% confident)`
         : "";
-      notes.push(
-        `${info.model_name} on ${info.device}, detected ${info.detected_language}${probability}`
-      );
+      const engine = info.engine === "deepgram"
+        ? `Deepgram ${info.model_name}`
+        : `${info.model_name} on ${info.device}`;
+      notes.push(`${engine}, detected ${info.detected_language}${probability}`);
     }
     ui.resultsNote.textContent = notes.join(" · ");
     ui.results.hidden = false;
@@ -811,8 +1019,9 @@
         ? `Saved the audio as ${label}`
         : `Saved the video at ${label}`;
     }
-    return job.used_existing_captions
-      ? "Exported the video's own captions"
+    if (job.used_existing_captions) return "Exported the video's own captions";
+    return job.transcription && job.transcription.engine === "deepgram"
+      ? "Transcribed by Deepgram"
       : "Transcribed on this computer";
   }
 

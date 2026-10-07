@@ -81,27 +81,36 @@
       <ul class="chips" id="formats" role="group" aria-labelledby="formats-label"></ul>
     </div>
 
+    <fieldset class="radios engine" id="engine-block">
+      <legend class="label" id="engine-label">Transcribe with</legend>
+      <ul class="chips" id="engines" role="radiogroup" aria-labelledby="engine-label"></ul>
+      <select id="model" aria-label="Model"></select>
+      <input id="model-custom" type="text" spellcheck="false" hidden
+             aria-label="Custom model name or folder">
+      <div class="key-row" id="key-row" hidden>
+        <input id="deepgram-key" type="password" spellcheck="false" autocomplete="off"
+               placeholder="Paste your Deepgram API key"
+               aria-label="Deepgram API key">
+        <button type="button" class="btn-ghost" id="key-save">Save</button>
+      </div>
+      <div class="key-saved" id="key-saved" hidden>
+        <span class="note" id="key-saved-text"></span>
+        <button type="button" class="btn-quiet" id="key-forget">Forget</button>
+      </div>
+      <p class="help" id="engine-help"></p>
+      <label class="opt" id="force-row"><input type="checkbox" id="force"> Transcribe even when the video has captions</label>
+    </fieldset>
+
     <details class="options" id="options-panel">
-      <summary>Options</summary>
+      <summary>More options</summary>
       <div class="options-grid">
-        <label class="opt"><input type="checkbox" id="force"> Always transcribe, ignore existing captions</label>
         <label class="opt"><input type="checkbox" id="allow-translated"> Accept machine-translated tracks</label>
         <label class="opt"><input type="checkbox" id="timestamped-txt"> Timestamps in the TXT file</label>
         <label class="opt"><input type="checkbox" id="overwrite"> Replace files instead of numbering them</label>
         <label class="opt"><input type="checkbox" id="postprocess" checked> Clean and reflow the subtitles</label>
         <label class="opt"><input type="checkbox" id="keep-audio"> Keep the prepared audio</label>
-        <fieldset class="radios">
-          <legend class="label">Whisper model</legend>
-          <div class="radio-list" id="models"></div>
-          <input id="model-custom" type="text" spellcheck="false" hidden
-                 aria-label="Custom model name or folder"
-                 placeholder="Model name or folder, e.g. tarteel-ai/whisper-base-ar-quran">
-          <p class="help">Only used when the video has no caption track to reuse.
-            Bigger models are more accurate and slower, and each one downloads
-            once the first time you pick it.</p>
-        </fieldset>
 
-        <fieldset class="radios">
+        <fieldset class="radios" id="device-block">
           <legend class="label">Device</legend>
           <div class="radio-list">
             <label class="radio">
@@ -123,10 +132,7 @@
           <label class="label" for="prompt">Names and spellings</label>
           <input id="prompt" type="text"
                  placeholder="Speaker names, places, recurring terms">
-          <p class="help">Whisper reads this before it listens, so unusual words
-            come out spelled the way you write them here. Write the names as you
-            want them to appear, separated by commas. It is a hint, not a filter:
-            nothing is dropped for being absent from the list.</p>
+          <p class="help" id="prompt-help"></p>
         </div>
       </div>
     </details>

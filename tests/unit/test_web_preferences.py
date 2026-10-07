@@ -149,3 +149,30 @@ def test_preferences_never_change_the_cli_configuration(store: Path) -> None:
     assert config.default_language == "ar"
     assert config.default_output_formats == ("srt", "vtt")
     assert "web-preferences" in store.name
+
+
+def test_the_engine_and_each_engines_model_are_remembered(store: Path) -> None:
+    with client_for(store) as client:
+        client.put(
+            "/api/preferences",
+            json={"engine": "deepgram", "model": "medium", "deepgram_model": "nova-3"},
+            headers=HEADERS,
+        )
+    with client_for(store) as client:
+        starting = client.get("/api/health", headers=HEADERS).json()["preferences"]
+    assert starting["engine"] == "deepgram"
+    # Switching back to Whisper finds its own model where it was left.
+    assert starting["model"] == "medium"
+    assert starting["deepgram_model"] == "nova-3"
+
+
+def test_without_a_choice_the_engine_comes_from_configuration() -> None:
+    resolved = resolve(WebPreferences(), Config(transcription_engine="deepgram"))
+    assert resolved["engine"] == "deepgram"
+    assert resolved["deepgram_model"] == "nova-3"
+
+
+def test_an_unknown_engine_falls_back_alone(store: Path) -> None:
+    store.write_text(json.dumps({"engine": "siri", "model": "base"}), encoding="utf-8")
+    loaded = load_preferences(store)
+    assert loaded.engine is None and loaded.model == "base"

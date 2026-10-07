@@ -2,13 +2,18 @@
 
 CaptionForge downloads and exports existing YouTube captions. When no matching
 caption exists, it prepares mono 16 kHz audio and transcribes it locally with
-`faster-whisper`. It transcribes video and audio files already on your computer
-the same way. It can also save a YouTube video itself as an MP4 at a chosen
-quality, or its audio alone as an MP3.
+`faster-whisper`, or, if you pick it, has [Deepgram](https://deepgram.com)
+transcribe it online with your own API key. It transcribes video and audio files
+already on your computer the same way. It can also save a YouTube video itself
+as an MP4 at a chosen quality, or its audio alone as an MP3.
 
 The caption and transcription workflows still never fetch the video stream:
 whole-file downloads happen only when you ask for one, through `download` or
 the page's download row.
+
+Transcription runs on this computer unless you pick Deepgram. Deepgram is the
+only path that sends anything of yours off it: a compressed copy of the audio,
+and only when a caption track is not being reused. Whisper stays the default.
 
 ## Features
 
@@ -30,6 +35,7 @@ the page's download row.
 - Clean per-job intermediate files, or preserve them on request
 - Automatically select CPU or NVIDIA CUDA and a suitable compute type
 - Transcribe locally with VAD, timestamps, progress, and cancellation support
+- Or transcribe online with Deepgram Nova-3, sending compressed audio only
 - Conservatively clean Arabic, Latin, and mixed-language subtitle text
 - Repair timing, remove repetition, and format subtitles to two readable lines
 - Retry temporary network failures without retrying invalid input
@@ -70,8 +76,17 @@ captionforge web
 
 CaptionForge prints a `http://127.0.0.1:PORT/?t=TOKEN` link and opens it. Paste a
 video link, pick a language and formats, and download the results. Nothing is
-uploaded anywhere: yt-dlp, FFmpeg, and faster-whisper all run locally, exactly as
-they do for the commands below.
+uploaded anywhere unless you pick Deepgram: yt-dlp, FFmpeg, and faster-whisper
+all run locally, exactly as they do for the commands below.
+
+The choices people change most sit in the card itself, under **Transcribe
+with**: Whisper (this computer) or Deepgram (online), a dropdown of that
+engine's models, and **Transcribe even when the video has captions**. The
+sentences around the button follow them, so the button reads **Transcribe**
+once the override is ticked, and the track note says what will happen instead.
+Everything rarer (machine-translated tracks, TXT timestamps, replacing files,
+cleanup, keeping audio, the device, names and spellings) is under **More
+options**.
 
 A file on this computer works too. Click **Choose file**, drop the file anywhere
 on the page, or paste its path into the link field. A file has no caption tracks
@@ -95,8 +110,8 @@ captionforge web --port 8800    # bind a fixed port instead of a free one
 captionforge web --no-open      # print the link without opening a browser
 ```
 
-The page remembers the language, formats, model, device, options, and vocabulary
-hint you last used, and opens with them next time. They are kept in
+The page remembers the language, formats, engine, each engine's model, device,
+options, and vocabulary hint you last used, and opens with them next time. They are kept in
 `$XDG_CONFIG_HOME/captionforge/web-preferences.json`, beside `config.json` but
 separate from it: interface choices never change what the CLI does. Delete that
 file to start from the configured defaults again. Browser storage is not used,
@@ -164,6 +179,47 @@ and the dock shows its icon, and delete
 `~/.local/share/captionforge/browser-window`, the browser profile the old
 window used.
 
+## Deepgram
+
+Deepgram is an online speech-to-text service. CaptionForge can use it instead of
+Whisper when you want its accuracy or speed, or when this computer is slow. It
+costs Deepgram credit, and it needs an API key from your Deepgram account
+(Console → API Keys; the Member role or higher).
+
+Save the key once, in any of these ways:
+
+- On the page or in the window: pick **Deepgram**, paste the key, and click
+  **Save**.
+- In a terminal: `captionforge deepgram-key`, which asks for it without
+  showing what you type. `captionforge deepgram-key --forget` removes it.
+- In the environment: `CAPTIONFORGE_DEEPGRAM_API_KEY` or `DEEPGRAM_API_KEY`,
+  also read from `.env`. These take priority over a saved key.
+
+A pasted key is checked with Deepgram before it is saved, and a key Deepgram
+refuses is never saved. Offline, it is saved and checked again on first use. The
+saved key lives in `~/.config/captionforge/deepgram.key`, readable only by you.
+It is deliberately not a `config` setting, so `config show` never prints it. The
+page and the window only ever show its last four characters.
+
+What is sent, and when:
+
+- Only when a transcription actually runs. A video whose caption track is
+  reused sends nothing, and needs no key.
+- Only the audio, as mono Opus at 48 kbps: about 21 MB per hour. The page and
+  the window show the size for the video you looked up.
+- The language you set is sent as such. Leave the field empty and Deepgram
+  detects it, from about 35 languages.
+- **Names and spellings** go as Deepgram key terms, one per comma.
+
+Nova-3 is the default model and covers Arabic, its regional variants, Turkish,
+and many more. Any other Deepgram model can be named under **Something else…**
+or with `--model`.
+
+```bash
+captionforge transcribe ~/Videos/lecture.mp4 --engine deepgram --language tr
+captionforge config set transcription_engine deepgram   # make it the default
+```
+
 ## Usage
 
 Inspect a video and its caption tracks:
@@ -201,7 +257,8 @@ the document heading, and Arabic (or any other right-to-left language) is writte
 right-aligned with the correct text direction. `--timestamped-txt` affects TXT
 only and never adds timings to the Word document.
 
-Export captions when available, otherwise transcribe locally:
+Export captions when available, otherwise transcribe locally (or with Deepgram,
+using `--engine deepgram`):
 
 ```bash
 captionforge transcribe "https://youtu.be/qJFbKl6RjLU" \
@@ -216,14 +273,14 @@ captionforge transcribe ~/Videos/lecture.mp4 --language ar --format srt
 captionforge transcribe "/home/me/Voice notes/meeting.m4a" --format docx
 ```
 
-A file has no captions to reuse, so it always goes to Whisper. The file itself
+A file has no captions to reuse, so it is always transcribed. The file itself
 is read, never moved or changed; the transcript lands in the output folder,
 named after the file. `inspect` shows a file's length, and a file with no sound
 in it is refused before any model loads. `extract` and `download` are for
 YouTube only, and say so if given a file.
 
-The command reuses a suitable YouTube caption by default. Use `--force` to run
-Whisper anyway, `--keep-audio` to preserve prepared audio, and `--overwrite` to
+The command reuses a suitable YouTube caption by default. Use `--force` to
+transcribe anyway, `--keep-audio` to preserve prepared audio, and `--overwrite` to
 replace output files.
 
 Existing output is never replaced or refused. When the natural filename is
@@ -236,7 +293,8 @@ large-model default on low-resource machines.
 Transcription quality options:
 
 - `--prompt` supplies a vocabulary hint. Proper nouns and domain terms in the
-  prompt measurably improve how Whisper spells them.
+  prompt measurably improve how Whisper spells them. Deepgram receives them as
+  key terms, one per comma.
 - `whisper_word_timestamps` (default on) makes CaptionForge cut subtitle lines
   on real word boundaries instead of estimating them from character counts. It
   costs a little speed and is what `whisper_hallucination_silence_threshold`
@@ -289,8 +347,9 @@ starts. `captionforge config set check_for_updates false` stops CaptionForge
 from looking by itself; `captionforge update` still works.
 
 Run `captionforge doctor` to check FFmpeg and FFprobe, yt-dlp, faster-whisper,
-python-docx, CUDA, the detected GPU, recommendations, and folder access. Doctor never
-downloads a model.
+python-docx, CUDA, the detected GPU, recommendations, folder access, the
+transcription engine, and whether a Deepgram key is set. Doctor never downloads a
+model and never contacts Deepgram.
 
 Post-processing is enabled for both downloaded captions and Whisper results. Use
 `--no-postprocess` with `extract` or `transcribe` when source segmentation must be
@@ -345,6 +404,8 @@ CAPTIONFORGE_WHISPER_NO_SPEECH_THRESHOLD=0.6
 CAPTIONFORGE_WHISPER_HALLUCINATION_SILENCE_THRESHOLD=
 CAPTIONFORGE_WHISPER_LANGUAGE=
 CAPTIONFORGE_WHISPER_MODEL_DOWNLOAD_DIRECTORY=
+CAPTIONFORGE_TRANSCRIPTION_ENGINE=whisper
+CAPTIONFORGE_DEEPGRAM_MODEL=nova-3
 CAPTIONFORGE_MAXIMUM_CHARACTERS_PER_LINE=42
 CAPTIONFORGE_MAXIMUM_SUBTITLE_LINES=2
 CAPTIONFORGE_MINIMUM_SUBTITLE_DURATION=0.8
@@ -361,7 +422,8 @@ CAPTIONFORGE_MINIMUM_FREE_DISK_BYTES=104857600
 CAPTIONFORGE_CHECK_FOR_UPDATES=true
 ```
 
-`CAPTIONFORGE_CONFIG_FILE` may point to another config file. Invalid persisted
+`CAPTIONFORGE_CONFIG_FILE` may point to another config file. The Deepgram key is
+not one of these settings; see [Deepgram](#deepgram). Invalid persisted
 values fall back individually to safe defaults; invalid values passed to
 `config set` are rejected.
 
@@ -372,8 +434,8 @@ Whisper, CUDA, or Python details. Technical causes, job identifiers, stages,
 selected methods, model/device choices, retries, output paths, and durations are
 written to `logs/`. Logs rotate at 10 MB and are retained for 14 days.
 
-CaptionForge retries translated temporary metadata, caption, audio-download, and
-model-load failures. Invalid URLs, unsupported resources, unavailable videos,
+CaptionForge retries translated temporary metadata, caption, audio-download,
+model-load, and Deepgram connection failures. Invalid URLs, unsupported resources, unavailable videos,
 bad timestamps, missing FFmpeg, invalid model names, and invalid output paths
 are not retried. Interrupting a job cancels it and removes temporary and partial
 files unless preservation was requested.
@@ -411,6 +473,12 @@ files unless preservation was requested.
   missing, the wheels are genuinely absent or the GPU is unusable; run with
   `--device cpu` in the meantime. `doctor` names the specific libraries it could
   not load.
+- **Deepgram errors** say what to do. A refused key (401 or 403) needs a new key
+  with the Member role or higher, and is never retried. "Out of credit" (402)
+  needs a top-up in the Deepgram console. A refused request names Deepgram's
+  reason, usually a language the chosen model does not cover. Deepgram stops
+  working on a request after 10 minutes, so an extremely long recording may be
+  refused as too long; Whisper has no such limit.
 - Increase `retry_count` or `retry_delay_seconds` for throttling and unstable
   connections.
 - For GPU memory errors, use a smaller model, `--compute-type int8`, or
@@ -429,7 +497,9 @@ Useful options:
 --overwrite         Replace existing output files instead of numbering
 --no-postprocess    Bypass Phase 6 processing
 --allow-translated  Also consider machine-translated caption tracks
---prompt TEXT       Vocabulary hint for Whisper (names, terms)
+--engine ENGINE     whisper (this computer) or deepgram (online)
+--model NAME        A Whisper model or folder, or a Deepgram model
+--prompt TEXT       Names and terms: a hint for Whisper, key terms for Deepgram
 ```
 
 Run `captionforge --help` or `captionforge extract --help` for the complete
@@ -449,7 +519,7 @@ track is unavailable.
 
 YouTube also publishes machine translations of its automatic transcription for
 roughly 150 languages. These are translations of a transcription and rank
-*below* having no track at all, so `transcribe` falls back to local Whisper
+*below* having no track at all, so `transcribe` falls back to transcription
 instead of exporting them. `inspect` marks them in a `Translated` column, and
 `--allow-translated` opts back in.
 
@@ -488,6 +558,8 @@ Run optional integrations explicitly:
 - The desktop app offers what the page offers; its applications-menu entry has been verified on Linux only
 - No authenticated or cookie-based access
 - No speaker diarization, translation, or aggressive spelling/grammar rewriting
+- Cancelling while Deepgram is transcribing stops CaptionForge waiting at once,
+  but Deepgram finishes, and bills, a request whose audio it already has
 
 For implementation details, see the
 [Phase 6 report](docs/phase-6-report.md),
